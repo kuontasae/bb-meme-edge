@@ -25,6 +25,7 @@ function runSchema(db: SqliteDatabase): void {
       name TEXT,
       chain TEXT,
       narrative TEXT,
+      signal_type TEXT,
       edge_score INTEGER,
       status TEXT,
       score_breakdown TEXT,
@@ -98,11 +99,92 @@ function runSchema(db: SqliteDatabase): void {
       nansen_signal_review TEXT,
       created_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS alerts (
+      alert_id TEXT PRIMARY KEY,
+      token_address TEXT NOT NULL,
+      signal_id TEXT,
+      alert_type TEXT NOT NULL,
+      alert_score INTEGER,
+      triggered_at TEXT NOT NULL,
+      channel_id TEXT,
+      reason TEXT,
+      quality_gate_grade TEXT,
+      quality_gate_reasons TEXT,
+      quality_gate_warnings TEXT,
+      deep_check_id TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS deep_checks (
+      deep_check_id TEXT PRIMARY KEY,
+      token_address TEXT NOT NULL,
+      signal_id TEXT,
+      flow_quality TEXT,
+      holder_quality TEXT,
+      buyer_seller_balance TEXT,
+      sell_pressure TEXT,
+      cluster_risk TEXT,
+      final_note TEXT,
+      raw_summary TEXT,
+      wallet_quality_summary TEXT,
+      wallet_behavior_counts TEXT,
+      estimated_independent_wallets INTEGER,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS wallet_quality_snapshots (
+      id TEXT PRIMARY KEY,
+      token_address TEXT NOT NULL,
+      signal_id TEXT,
+      wallet_address TEXT,
+      behavior_type TEXT,
+      buy_count INTEGER,
+      sell_count INTEGER,
+      touched_token_count INTEGER,
+      avg_trade_size REAL,
+      wsol_trade_ratio REAL,
+      mirror_group_id TEXT,
+      cluster_risk TEXT,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS learning_summaries (
+      learning_summary_id TEXT PRIMARY KEY,
+      period TEXT NOT NULL,
+      start_time TEXT NOT NULL,
+      end_time TEXT NOT NULL,
+      signal_type_summary TEXT,
+      mcap_bucket_summary TEXT,
+      age_bucket_summary TEXT,
+      flow_mcap_bucket_summary TEXT,
+      cluster_risk_summary TEXT,
+      wallet_behavior_summary TEXT,
+      next_score_adjustment TEXT,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS nansen_credit_logs (
+      credit_log_id TEXT PRIMARY KEY,
+      command_name TEXT NOT NULL,
+      before_credits INTEGER,
+      after_credits INTEGER,
+      used_credits INTEGER,
+      use_mock_nansen INTEGER NOT NULL,
+      created_at TEXT NOT NULL
+    );
   `);
 
   // 既存DBにもResearch Cardの元メッセージ情報を後付けします。
+  ensureColumn(db, "signals", "signal_type", "TEXT");
   ensureColumn(db, "signals", "message_id", "TEXT");
   ensureColumn(db, "signals", "channel_id", "TEXT");
+  ensureColumn(db, "alerts", "quality_gate_grade", "TEXT");
+  ensureColumn(db, "alerts", "quality_gate_reasons", "TEXT");
+  ensureColumn(db, "alerts", "quality_gate_warnings", "TEXT");
+  ensureColumn(db, "alerts", "deep_check_id", "TEXT");
+  ensureColumn(db, "deep_checks", "wallet_quality_summary", "TEXT");
+  ensureColumn(db, "deep_checks", "wallet_behavior_counts", "TEXT");
+  ensureColumn(db, "deep_checks", "estimated_independent_wallets", "INTEGER");
 }
 
 function initDatabase(): SqliteDatabase {
