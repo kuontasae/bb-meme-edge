@@ -239,7 +239,7 @@ type NetflowRow = {
 
 type NansenDataSource = "mock" | "cache" | "live";
 type NansenFetchMode = "mock" | "live";
-type MemeStatus = "🟢 Strong Edge" | "🟡 Watch" | "🟠 High-risk Speculative" | "🔴 Weak";
+type MemeStatus = "🟢 強め" | "🟡 監視候補" | "🟠 高リスク・様子見" | "🔴 弱い";
 
 type NansenFetchMetadata = {
   requestedCandidatePoolSize: number;
@@ -395,6 +395,7 @@ type ScoringConfig = {
     minMcap: number;
     maxMcap: number;
     minLiquidityUsd: number;
+    thinLiquidityThresholdUsd: number;
     minScore: number;
     minFlowMcap: number;
     min24hFlowUsd: number;
@@ -510,11 +511,13 @@ type MemeResearchCard = {
   signalType: SignalType;
   edgeScore: number;
   status: MemeStatus;
+  cliGrade: CliGrade;
   scoreBreakdown: string;
   summary: string;
   scanTime: string;
   marketCap: number | null;
   price: number | null;
+  liquidity: number | null;
   flow24h: number | null;
   flow7d: number | null;
   flowMcapRatio: number | null;
@@ -725,6 +728,7 @@ type AlertV2Candidate = {
   postedMessageId: string | null;
   entryMcap: number | null;
   entryPrice: number | null;
+  tokenIconUrl: string | null;
   rawDexscreenerSnapshot: unknown;
   createdAt: string;
   card: MemeResearchCard;
@@ -775,11 +779,12 @@ const DEFAULT_SCORING_CONFIG: ScoringConfig = {
     cliOracleCheckSize: 5,
     minMcap: 30_000,
     maxMcap: 2_000_000,
-    minLiquidityUsd: 40_000,
+    minLiquidityUsd: 15_000,
+    thinLiquidityThresholdUsd: 40_000,
     minScore: 75,
     minFlowMcap: 0.03,
     min24hFlowUsd: 5_000,
-    minTraders: 3,
+    minTraders: 2,
     min1hFlowUsd: 1_500,
     min4hFlowUsd: 3_000,
     shortTermFlowOptional: true,
@@ -2497,18 +2502,18 @@ function riskLabelFromScore(riskAdjustment: number): ScoreBreakdown["riskLabel"]
 
 function getStatus(edgeScore: number): MemeStatus {
   if (edgeScore >= 80) {
-    return "🟢 Strong Edge";
+    return "🟢 強め";
   }
 
   if (edgeScore >= 65) {
-    return "🟡 Watch";
+    return "🟡 監視候補";
   }
 
   if (edgeScore >= 50) {
-    return "🟠 High-risk Speculative";
+    return "🟠 高リスク・様子見";
   }
 
-  return "🔴 Weak";
+  return "🔴 弱い";
 }
 
 function buildNarrative(row: NetflowRow, symbol: string, name: string): string {
@@ -2968,7 +2973,7 @@ function buildDetectionReasons(params: {
   if (params.marketCap !== null && params.flowMcapRatio !== null) {
     reasons.push([
       "• 小型MCapに対して資金流入あり",
-      `  MCap ${formatCompactUsd(params.marketCap)} / Flow-MCap ${formatPercent(params.flowMcapRatio)}。少額flowでも価格に反映されやすい帯か確認します。`,
+      `  MCap ${formatCompactUsd(params.marketCap)} / Flow/MCap ${formatPercent(params.flowMcapRatio)}。少額flowでも価格に反映されやすい帯か確認します。`,
     ].join("\n"));
   }
 
@@ -3654,6 +3659,7 @@ async function buildMemeResearchCards(rows: NetflowRow[]): Promise<MemeResearchC
       signalType,
       edgeScore,
       status: getStatus(edgeScore),
+      cliGrade: "Unchecked",
       scoreBreakdown,
       summary:
         `${formatCompactUsd(flow24h)}の24h Smart Money flowでFresh Scan入り。` +
@@ -3662,6 +3668,7 @@ async function buildMemeResearchCards(rows: NetflowRow[]): Promise<MemeResearchC
       scanTime,
       marketCap,
       price,
+      liquidity,
       flow24h,
       flow7d,
       flowMcapRatio,
@@ -4473,19 +4480,78 @@ function saveMemeSignals(cards: MemeResearchCard[]): void {
 }
 
 function getStatusColor(status: MemeStatus): number {
-  if (status === "🟢 Strong Edge") {
+  if (status === "🟢 強め") {
     return 0x2ecc71;
   }
 
-  if (status === "🟡 Watch") {
+  if (status === "🟡 監視候補") {
     return 0xf1c40f;
   }
 
-  if (status === "🟠 High-risk Speculative") {
+  if (status === "🟠 高リスク・様子見") {
     return 0xe67e22;
   }
 
   return 0xe74c3c;
+}
+
+function formatNansenGrade(grade: CliGrade | null | undefined): string {
+  return grade && grade !== "Unchecked" ? grade : "未検証";
+}
+
+function buildCardStatsRows(card: MemeResearchCard): Array<[string, string]> {
+  return [
+    ["時価総額", formatCompactUsd(card.marketCap)],
+    ["流動性", formatCompactUsd(card.liquidity)],
+    ["経過日数", card.ageDays !== null ? `${card.ageDays.toFixed(1)}日` : card.tokenAge],
+    ["Flow/MCap", formatPercent(card.flowMcapRatio)],
+    ["24h流入", formatCompactUsd(card.flow24h)],
+    ["Traders", `${formatCount(card.traderCount)}人`],
+  ];
+}
+
+function buildCardDetectionRows(
+  card: MemeResearchCard,
+  deepCheck?: DeepCheckReply,
+): Array<[string, string]> {
+  const rows: Array<[string, string]> = [];
+
+  if (card.flowMcapRatio !== null) {
+    rows.push([`Flow/MCap ${formatPercent(card.flowMcapRatio)}`, "MCap比で流入強め"]);
+  }
+
+  if (card.traderCount !== null) {
+    const traderNote = card.traderCount >= 3 ? "複数walletが反応" : "少数walletの反応";
+    rows.push([`Traders ${formatCount(card.traderCount)}人`, traderNote]);
+  }
+
+  if (deepCheck) {
+    const hasHighRisk = (
+      deepCheck.holderQuality.label === "High" ||
+      deepCheck.sellPressure.label === "High" ||
+      deepCheck.clusterRisk.label === "High"
+    );
+
+    if (!hasHighRisk) {
+      rows.push(["Risk Highなし", "Holder / Sell / Cluster確認済み"]);
+    }
+
+    if (rows.length < 3 && deepCheck.buyerSellerBalance.label === "Bullish") {
+      rows.push(["売買バランス", "買い優勢"]);
+    } else if (rows.length < 3 && deepCheck.buyerSellerBalance.label === "Neutral") {
+      rows.push(["売買バランス", "中立"]);
+    }
+  }
+
+  if (rows.length < 3 && (card.flow24h ?? 0) > 0) {
+    rows.push([`24h流入 ${formatCompactUsd(card.flow24h)}`, "Smart Money flowあり"]);
+  }
+
+  if (rows.length === 0) {
+    rows.push(["Smart Money flow", "検出済み"]);
+  }
+
+  return rows.slice(0, 3);
 }
 
 function shortenAddress(address: string): string {
@@ -4505,25 +4571,27 @@ function buildResearchCardEmbed(
     `[GMGN](${card.gmgnUrl})`,
     `[UniversalX](${card.universalxUrl})`,
   ].join("｜");
-  const whyFlagged = card.whyFlagged.replace(/^- /gm, "• ");
   const riskLabels = getResearchCardRiskLabels(card);
   const description = [
     "**判定**",
     ...formatTreeRows([
-      ["Score", `${card.edgeScore}/100 ${card.status}`],
-      ["Signal", formatSignalTypeLabel(card.signalType)],
-      ["Risk", formatDisplayRiskLine(riskLabels)],
+      ["評価", `${card.status}｜${card.edgeScore}/100`],
+      ["検出理由", formatSignalTypeLabel(card.signalType)],
+      ["注意点", formatDisplayRiskLine(riskLabels)],
+      ["Nansen評価", formatNansenGrade(card.cliGrade)],
     ]),
     "",
     "**Stats**",
-    ...formatTreeRows([
-      ["MCap", formatCompactUsd(card.marketCap)],
-      ["Age", card.ageDays !== null ? `${card.ageDays.toFixed(1)}日` : card.tokenAge],
-    ]),
+    ...formatTreeRows(buildCardStatsRows(card)),
     "",
-    `**CA:** \`${card.tokenAddress}\``,
-    `**関連リンク:**\n${relatedLinks}`,
-    `**検出理由:**\n${whyFlagged}`,
+    "**検出理由**",
+    ...formatTreeRows(buildCardDetectionRows(card)),
+    "",
+    "**CA**",
+    `\`${card.tokenAddress}\``,
+    "",
+    "**関連リンク**",
+    relatedLinks,
   ].join("\n");
 
   const embed = new EmbedBuilder()
@@ -4590,7 +4658,7 @@ function buildAlertMomentumComponents(candidate: AlertV2Candidate): Record<strin
     flowMcapImpact: Math.min(25, Math.round((flowMcap / 0.08) * 25)),
     flow24hStrength: Math.min(15, Math.round((Math.log10(flow24h + 1) / 5) * 15)),
     tradersConfirmation: traders >= 12 ? 15 : traders >= 8 ? 12 : traders >= 5 ? 9 : traders >= 3 ? 6 : 0,
-    liquidityQuality: liquidity >= 100_000 ? 10 : liquidity >= scoringConfig.alertRules.minLiquidityUsd ? 7 : liquidity > 0 ? 2 : 0,
+    liquidityQuality: liquidity >= 100_000 ? 10 : liquidity >= scoringConfig.alertRules.thinLiquidityThresholdUsd ? 7 : liquidity >= scoringConfig.alertRules.minLiquidityUsd ? 4 : liquidity > 0 ? 1 : 0,
     freshnessScore: scoreAlertFreshness(candidate.candidateFreshnessMinutes),
     ageRelevance: candidate.ageDays === null ? 2 : candidate.ageDays <= 1 ? 5 : candidate.ageDays <= 5 ? 4 : candidate.ageDays <= 30 ? 2 : 0,
     flow7dContinuity: (candidate.flow7d ?? 0) > 0 ? 5 : 0,
@@ -4620,11 +4688,13 @@ function createAlertCardFromCandidate(candidate: AlertV2Candidate): MemeResearch
     signalType: "alert_edge",
     edgeScore: candidate.alertMomentumScore,
     status: getStatus(candidate.alertMomentumScore),
+    cliGrade: candidate.cliGrade,
     scoreBreakdown: JSON.stringify(candidate.alertMomentumComponents),
-    summary: `Alert v2: MCap ${formatCompactUsd(candidate.marketCap)} / Flow-MCap ${formatPercent(candidate.flowMcapRatio)}`,
+    summary: `Alert v2: MCap ${formatCompactUsd(candidate.marketCap)} / Flow/MCap ${formatPercent(candidate.flowMcapRatio)}`,
     scanTime: candidate.createdAt,
     marketCap: candidate.marketCap,
     price: candidate.price,
+    liquidity: candidate.liquidity,
     flow24h: candidate.flow24h,
     flow7d: candidate.flow7d,
     flowMcapRatio: candidate.flowMcapRatio,
@@ -4632,7 +4702,7 @@ function createAlertCardFromCandidate(candidate: AlertV2Candidate): MemeResearch
     tokenAge: candidate.ageDays === null ? "不明" : `${candidate.ageDays.toFixed(1)}日`,
     whyFlagged: candidate.preFilterReason,
     risk: candidate.riskFlags.join(" / ") || "Quality Gateで確認",
-    tokenIconUrl: null,
+    tokenIconUrl: candidate.tokenIconUrl ?? getBestImageUrlFromValue(candidate.rawDexscreenerSnapshot),
     dexscreenerUrl: isValidHttpUrl(pairUrl) ? pairUrl : `https://dexscreener.com/solana/${tokenAddress}`,
     gmgnUrl: `https://gmgn.ai/sol/token/${tokenAddress}`,
     universalxUrl: `https://universalx.app/trade?assetId=101_${tokenAddress}`,
@@ -4693,7 +4763,11 @@ function buildAlertV2Candidate(params: {
   const isReaccelerated = params.sourceType === "nansen_new" ? false : reaccelerationReasons.length > 0;
   const riskFlags: string[] = [];
 
-  if (params.liquidity !== null && params.liquidity < scoringConfig.alertRules.minLiquidityUsd) riskFlags.push("thin_liquidity");
+  if (
+    params.liquidity !== null &&
+    params.liquidity >= scoringConfig.alertRules.minLiquidityUsd &&
+    params.liquidity < scoringConfig.alertRules.thinLiquidityThresholdUsd
+  ) riskFlags.push("thin_liquidity");
   if (isOldSource && !isReaccelerated) riskFlags.push("old_without_reacceleration");
 
   const candidate: AlertV2Candidate = {
@@ -4760,6 +4834,7 @@ function buildAlertV2Candidate(params: {
     postedMessageId: null,
     entryMcap: params.marketCap,
     entryPrice: params.price,
+    tokenIconUrl: getBestImageUrlFromValue(params.rawDexscreenerSnapshot),
     rawDexscreenerSnapshot: params.rawDexscreenerSnapshot ?? null,
     createdAt: nowIso,
     card: {} as MemeResearchCard,
@@ -4780,7 +4855,7 @@ function buildAlertV2Candidate(params: {
 
 function getAlertReasonLines(card: MemeResearchCard): string[] {
   return [
-    "MCap $2M以下",
+    `MCap ${formatCompactUsd(card.marketCap)}`,
     `Flow/MCap ${formatPercent(card.flowMcapRatio)}`,
     `24h Flow ${formatCompactUsd(card.flow24h)}`,
     `Traders ${formatCount(card.traderCount)}人`,
@@ -4790,9 +4865,8 @@ function getAlertReasonLines(card: MemeResearchCard): string[] {
 
 function isAlertCandidate(card: MemeResearchCard): boolean {
   const rules = scoringConfig.alertRules;
-  const mcapBucket = findRangeBucket(card.marketCap, scoringConfig.mcapBuckets);
 
-  if (card.marketCap === null || card.marketCap > rules.maxMcap || mcapBucket?.alertAllowed === false) {
+  if (card.marketCap === null) {
     return false;
   }
 
@@ -4800,11 +4874,7 @@ function isAlertCandidate(card: MemeResearchCard): boolean {
     return false;
   }
 
-  if ((card.flowMcapRatio ?? 0) < rules.minFlowMcap) {
-    return false;
-  }
-
-  if ((card.flow24h ?? 0) < rules.min24hFlowUsd) {
+  if ((card.flow24h ?? 0) <= 0) {
     return false;
   }
 
@@ -4822,17 +4892,16 @@ function applyAlertGate0(candidate: AlertV2Candidate, seen: Set<string>): void {
   if (candidate.tokenAddress === "UNKNOWN") reasons.push("token_addressなし");
   if (seen.has(candidate.tokenAddress)) reasons.push("重複token");
   if (candidate.marketCap === null) reasons.push("MCapなし");
-  if (candidate.marketCap !== null && candidate.marketCap < rules.minMcap) reasons.push("MCap下限未満");
-  if (candidate.marketCap !== null && candidate.marketCap > rules.maxMcap) reasons.push("MCap上限超え");
   if (candidate.liquidity === null) {
     reasons.push("liquidity_missing");
     if (!candidate.warningFlags.includes("liquidity_missing")) candidate.warningFlags.push("liquidity_missing");
     if (!candidate.riskFlags.includes("liquidity_missing")) candidate.riskFlags.push("liquidity_missing");
   } else if (candidate.liquidity < rules.minLiquidityUsd) {
     reasons.push("Liquidity不足");
+  } else if (candidate.liquidity < rules.thinLiquidityThresholdUsd && !candidate.riskFlags.includes("thin_liquidity")) {
+    candidate.riskFlags.push("thin_liquidity");
   }
-  if ((candidate.flow24h ?? 0) < rules.min24hFlowUsd) reasons.push("24h Flow不足");
-  if ((candidate.flowMcapRatio ?? 0) < rules.minFlowMcap) reasons.push("Flow/MCap不足");
+  if (candidate.flow24h === null || candidate.flow24h <= 0) reasons.push("24h Flowなし");
   if ((candidate.traderCount ?? 0) < rules.minTraders) reasons.push("Traders不足");
   if (candidate.marketDataAgeMinutes > rules.maxMarketDataAgeMinutes) reasons.push("market dataが古い");
   if (candidate.riskFlags.includes("old_without_reacceleration")) reasons.push("古いsourceで再加速なし");
@@ -4897,9 +4966,15 @@ async function enrichAlertCandidatesBeforeGate(candidates: AlertV2Candidate[]): 
     candidate.marketDataWarning = enrichment.warning;
     candidate.warningFlags = enrichment.warningFlags;
     candidate.rawDexscreenerSnapshot = enrichment.rawSnapshot;
+    candidate.tokenIconUrl = getBestImageUrlFromValue(enrichment.rawSnapshot) ?? candidate.tokenIconUrl;
     candidate.flowMcapRatio = candidate.marketCap && candidate.flow24h !== null ? candidate.flow24h / candidate.marketCap : null;
 
-    if (candidate.liquidity !== null && candidate.liquidity < scoringConfig.alertRules.minLiquidityUsd && !candidate.riskFlags.includes("thin_liquidity")) {
+    if (
+      candidate.liquidity !== null &&
+      candidate.liquidity >= scoringConfig.alertRules.minLiquidityUsd &&
+      candidate.liquidity < scoringConfig.alertRules.thinLiquidityThresholdUsd &&
+      !candidate.riskFlags.includes("thin_liquidity")
+    ) {
       candidate.riskFlags.push("thin_liquidity");
     }
 
@@ -5119,39 +5194,27 @@ function buildAlertEmbed(
     `[GMGN](${card.gmgnUrl})`,
     `[UniversalX](${card.universalxUrl})`,
   ].join("｜");
-  const qualityPassed = gate?.passed ? "✅ Passed" : "❌ Rejected";
-  const cliGrade = candidate?.cliGrade ?? "Unchecked";
-  const source = candidate ? sourceTypeLabel(candidate.candidateSourceType) : "Nansen New";
   const riskLabels = getAlertCardRiskLabels(card, deepCheck, gate, candidate);
-  const detectionReasons = [
-    `• Alert条件を通過\n  MCap ${formatCompactUsd(card.marketCap)} / Flow-MCap ${formatPercent(card.flowMcapRatio)}。小型に対して強いSmart Money flowです。`,
-    deepCheck ? `• 買い優勢\n  Buyer/Sellerは${deepCheck.buyerSellerBalance.label}。直近の買いと売りのバランスを確認済みです。` : null,
-    deepCheck ? `• リスク確認\n  Holder Risk / Sell Pressure / Cluster Risk はHighではありません。` : null,
-    candidate?.isReaccelerated ? `• 再加速\n  ${candidate.reaccelerationReason ?? "source検出時より条件が改善しています。"}` : null,
-  ].filter(Boolean).slice(0, 4).join("\n\n");
   const description = [
     "**判定**",
     ...formatTreeRows([
-      ["Score", `${card.edgeScore}/100 ${card.status}`],
-      ["Signal", formatSignalTypeLabel(card.signalType)],
-      ["Risk", formatDisplayRiskLine(riskLabels)],
-      ["Quality Gate", qualityPassed],
-      ["CLI Grade", cliGrade],
-      ["Source", source],
+      ["評価", `${card.status}｜${card.edgeScore}/100`],
+      ["検出理由", formatSignalTypeLabel(card.signalType)],
+      ["注意点", formatDisplayRiskLine(riskLabels)],
+      ["Nansen評価", formatNansenGrade(candidate?.cliGrade ?? card.cliGrade)],
     ]),
     "",
     "**Stats**",
-    ...formatTreeRows([
-      ["MCap", formatCompactUsd(card.marketCap)],
-      ["Age", card.tokenAge],
-      ["Flow/MCap", formatPercent(card.flowMcapRatio)],
-      ["24h Flow", formatCompactUsd(card.flow24h)],
-      ["Traders", `${formatCount(card.traderCount)}人`],
-    ]),
+    ...formatTreeRows(buildCardStatsRows(card)),
     "",
-    `**CA:** \`${card.tokenAddress}\``,
-    `**検出理由:**\n${detectionReasons}`,
-    `**関連リンク:**\n${relatedLinks}`,
+    "**検出理由**",
+    ...formatTreeRows(buildCardDetectionRows(card, deepCheck)),
+    "",
+    "**CA**",
+    `\`${card.tokenAddress}\``,
+    "",
+    "**関連リンク**",
+    relatedLinks,
   ].join("\n");
 
   const embed = new EmbedBuilder()
@@ -6329,13 +6392,7 @@ function evaluateAlertQualityGate(
   const warnings: string[] = [];
   const gateConfig = scoringConfig.qualityGate;
 
-  if (candidate.marketCap === null || candidate.marketCap > scoringConfig.alertRules.maxMcap) {
-    reasons.push(`MCap ${formatCompactUsd(scoringConfig.alertRules.maxMcap)}超え`);
-  }
-  if (candidate.marketCap !== null && candidate.marketCap < scoringConfig.alertRules.minMcap) {
-    reasons.push("MCap下限未満");
-  }
-  const candidateLiquidity = "liquidity" in candidate ? (candidate as MemeResearchCard & { liquidity?: number | null }).liquidity ?? null : null;
+  const candidateLiquidity = candidate.liquidity;
   if (candidateLiquidity !== null && candidateLiquidity < scoringConfig.alertRules.minLiquidityUsd) {
     reasons.push("Liquidity不足");
   }
@@ -6732,6 +6789,7 @@ async function getMemeScanResult(label: MemeScanLabel, options: { postTopSignals
     card.edgeScore = candidate.score;
     card.status = getStatus(candidate.score);
     card.signalType = candidate.signalType;
+    card.cliGrade = candidate.cliGrade;
     card.whyFlagged = buildDetectionReasons({
       marketCap: card.marketCap,
       flow24h: card.flow24h,
