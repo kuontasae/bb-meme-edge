@@ -1,296 +1,458 @@
 # bb Meme Edge
 
-## 概要
+Nansen Smart Money flowを使った、Solana memeの早期発見・答え合わせ・参加型ランキングBot。
 
-bb Meme Edge は、NansenのSmart Moneyデータを使ってSolana小型ミーム候補を発見し、Discord上でResearch Cardとして表示するBotです。
+bb Meme Edgeは、Nansen Smart Money flowを使ってSolana meme coinの早期兆候を検出し、Alertでユーザーに通知し、ユーザーPickと後追い成績を保存し、Recapで答え合わせしながら改善していくDiscord Botです。
 
-ユーザーは Conviction / エアIN / Watch でPaper Pickでき、Botは候補投稿時のMCapとユーザーがボタンを押した瞬間のMCapを記録します。
+## 1. 概要
 
-その後、1h / 6h / 24h Result、Leaderboard、Daily / Weekly / Monthly Recapで、Botとコミュニティの成績を可視化します。
+bb Meme Edgeは、Nansen Smart Money flowを使ってSolana meme coinの早期兆候を検出するDiscord Botです。
 
-## Demo Flow
+特徴:
 
-審査員がデモで確認しやすい基本フローです。
+- NansenでSmart Money flowを検出
+- Alertで今見るべき候補を通知
+- Fresh Scanで市場データを収集
+- 全候補を後追いしてPDCA
+- ユーザーは Conviction / エアIN / Watch でPick参加
+- `/my` と `/leaderboard` で成績確認
+- `/meme-recap` で日次・週次・月次の答え合わせ
 
-1. `/meme-scan`
-2. Research Cardを確認
-3. Conviction / エアIN / Watch を押す
-4. `/my-picks`
-5. `/meme-results period:latest`
-6. `/leaderboard period:daily`
-7. `/meme-recap period:daily`
-8. `/dev-post-result window:1h`
-9. `/dev-run-recap period:weekly`
+投資助言や自動売買ではありません。オンチェーンデータをもとに候補を見つけ、Paper Pickと振り返りで学習するための調査補助Botです。
 
-`/dev-post-result` と `/dev-run-recap` などのdev系コマンドは、デモ・開発確認用です。通常運用では定時スキャン・定時Recapによって自動投稿される想定です。
-
-## 解決する課題
-
-- Solanaミーム候補を探す時間がかかる
-- 何のトークンか、なぜ見るべきか分かりにくい
-- NansenのSmart Money dataをそのまま見ても初心者には解釈しづらい
-- 候補を出して終わりでは、あとで本当に伸びたか検証しづらい
-- コミュニティ内で誰のPaper Pickが良かったか見えにくい
-
-## 主な機能
-
-- Nansen Smart Money netflowから候補検出
-- Meme Edge Score
-- Status表示
-- Research Card
-- Conviction / エアIN / Watch
-- ボタン押下人数表示
-- Fresh Scan 最大5件
-- Meme Edge Alert
-- `/meme-results`
-- `/my-picks`
-- `/my-performance`
-- `/leaderboard`
-- `/meme-recap`
-- 1h / 6h / 24h Result
-- 定時スキャン
-- Daily / Weekly / Monthly Recap
-
-## Research Card
-
-Research Cardは、Discord上で候補をすぐ判断できるように、トークン概要・Smart Money signal・リンク・Paper Pickボタンを1枚にまとめます。
-
-表示内容:
-
-- Token symbol / name
-- token icon
-- Meme Edge Score
-- Status
-- Summary
-- Narrative
-- Why flagged
-- Entry data
-- Contract
-- Quick Links
-- Conviction / エアIN / Watch buttons
-
-Quick Links:
-
-- DexScreener
-- GMGN
-- UniversalX
-- Nansen deep dive placeholder
-
-UniversalXのSolanaリンク形式:
+## 2. Botの全体像
 
 ```text
-https://universalx.app/trade?assetId=101_<TOKEN_ADDRESS>
+Fresh Scan
+  ↓
+市場候補を広く保存
+  ↓
+Alert
+  ↓
+強候補だけ通知
+  ↓
+User Pick
+  ↓
+Conviction / エアIN / Watch
+  ↓
+Performance Tracking
+  ↓
+1h / 4h / 12h / 24h / 48h / 7d
+  ↓
+Recap / Leaderboard / My
+  ↓
+PDCA
 ```
 
-## Paper Pick ルール
+Fresh Scanは通知ではなく、Botを賢くするための市場観測です。Alertがユーザー向け通知の主役で、Recapが答え合わせ、User Picksが参加型要素です。
 
-- Watch: 0pt、ランキング対象外
-- エアIN: 1pt、ランキング対象
-- Conviction: 3pt、ランキング対象、1日1回まで
-- Daily Budget: 5pt
-- Score = Σ((return_x - 1) × used_points × 100)
+通常のユーザー体験では、Alertで強候補を見て、Conviction / エアIN / Watchを押し、あとで `/my`、`/leaderboard`、`/meme-recap` で結果を確認します。裏側ではFresh Scanと後追いtrackingがPDCA用データを蓄積します。
 
-例:
+## 3. Fresh Scan
 
-2.0x の エアIN:
+Fresh Scanはデータ収集・PDCA用です。通常はTop5 Research Cardを投稿しません。
+
+現在の設定:
+
+- `mode`: `data_collection`
+- `postTopSignals`: `false`
+- `cliOracleCheckSize`: `0`
+- `candidatePoolSize`: `1500`
+- Nansen limitは `1000` にclamp
+
+やること:
+
+- Nansen Broad Scan / Candidate Fetcher
+- `candidatePoolSize` 1500
+- Nansen limit 1000 clamp
+- Gate 0
+- Hard Reject
+- Momentum Gate
+- Pre-filter
+- 全候補保存
+- 後追いperformance対象化
+- Alert候補ソース化
+- Recap / PDCA用データ保存
+
+やらないこと:
+
+- 通常の定時Top5投稿
+- 通常のCLI Oracle
+- 通常のDiscord Result通知
+
+`/meme-scan` は手動でFresh Scanを実行します。デフォルトでは投稿せず、候補保存・Gate集計・完了サマリーを返します。Research Cardを見たい場合だけ `post:true` を指定します。
+
+表示例:
 
 ```text
-(2.0 - 1) × 1pt × 100 = +100 pts
+Fresh Scan完了。
+候補1000件を保存しました。
+Gate 0通過: 68件
+Momentum Gate通過: 44件
+Pre-filter通過: 25件
+投稿: OFF
+通知はAlertで行います。
 ```
 
-4.0x の Conviction:
+Fresh ScanでCLI Oracleを回さない候補は、`cli_checked=0` / `cli_oracle_status=skipped_data_collection_mode` として保存されます。CLI Gradeがなくても、候補保存・後追い・Recap集計・PDCAは継続します。
+
+## 4. Alert
+
+Alertはユーザー向け通知の主役です。
+
+現在のAlert v2:
+
+- `candidatePoolSize`: 300
+- Nansen候補: 240
+- Fresh Scan DB候補: 40
+- Watch / near-miss候補: 20
+- Pre-filter: 15
+- CLI Oracle: 最大5
+- `maxAlertsPerRun`: 3
+- DexScreener market data補完
+- Alert Quality Gate
+- Freshness / Reacceleration
+- 全候補保存
+- Alert後追い
+
+Alertの目的:
+
+- Fresh Scanの定時では拾いにくいタイミングの候補を拾う
+- 今見るべき候補だけ通知する
+- Alert後2x到達時はPump Hit通知する
+
+Alert Cardに出すもの:
+
+- Signal
+- Risk
+- MCap
+- Liquidity
+- Flow
+- Traders
+- CLI Grade / Quality Gate
+- CA
+- DexScreener / GMGN / UniversalXリンク
+- Conviction / エアIN / Watchボタン
+- Grokナラティブ導線がある場合は補助導線として表示
+
+AlertはMCapやflowの一次条件だけでは投稿されません。候補をPre-filterで絞ったあと、CLI Oracle、DexScreener補完、Wallet Quality、Alert Quality Gateを通して、強候補だけを最大3件投稿します。
+
+## 5. Signal / Risk 表示
+
+ユーザー向けUIでは、内部の `signal_type` をそのまま出さず、SignalとRiskに分けます。
+
+Signal:
+
+- 🚨 強シグナル
+- 📈 資金流入あり
+- 🐋 大口流入
+
+Risk:
+
+- ⚠️ 流動性薄め
+- 🤖 不自然flow疑い
+- 👥 Holder集中
+- 🔻 売り圧強め
+
+Signalは「なぜ検出されたか」。Riskは「何に注意すべきか」です。
+
+内部の `signal_type` 値は互換性のため維持します。
+
+- `alert_edge`
+- `flow_watch`
+- `whale_flow`
+- `thin_liquidity`
+- `bot_like_flow`
+
+ただしUIでは、Thin LiquidityやBot-like FlowはSignalではなくRiskとして表示します。
+
+## 6. User Picks
+
+ユーザーは各候補に対してボタンで反応できます。
+
+ボタン:
+
+- Conviction: 強く見ている
+- エアIN: 実際には買わないが仮想IN
+- Watch: 監視
+
+`/my` では自分のPick履歴・成績を確認できます。
+
+表示例:
 
 ```text
-(4.0 - 1) × 3pt × 100 = +900 pts
+👤 My Meme Edge
+
+📊 成績サマリー
+├ Picks　5
+├ 勝率　75.0%
+├ 平均　1.04x
+└ 最高Pick　$ASTEROID 1.74x
+
+📌 最近のPick
+├ Conviction　$MAGA 1.00x｜$DIVINE N/A｜$ASTEROID 1.30x
+├ エアIN　$EWON 0.15x
+└ Watch　$ASTEROID 1.74x
+
+🧠 ボタン別成績
+├ Conviction　3 picks｜平均 1.15x
+├ エアIN　1 pick｜平均 0.15x
+└ Watch　1 pick｜平均 1.74x
 ```
 
-Paper Pickは実取引ではありません。候補を見た時点の判断をPaper上で記録し、あとから結果を検証するための仕組みです。
+`/leaderboard` では全体ランキングを確認できます。表示では「Best」ではなく「最高Pick」に統一し、倍率は原則小数2桁、装飾emoji付きsymbolは表示時にcleanします。
 
-## Nansen活用
+Paper Pickは実取引ではありません。Discord上でMeme発見ゲームとして参加し、あとから結果を検証するための仕組みです。
 
-- Nansen CLI / API でSmart Money netflowを取得
-- Smart Money Flow、Flow/MCap、24h / 7d Flow、Trader数、Token ageなどを使ってMeme Edge Scoreを計算
-- Nansen Signal ReviewでDaily / Weekly / Monthlyに勝ちパターンを振り返る
-- 現在はmock/cacheでクレジット消費を抑えながら開発可能
-- 将来的に token info / flow-intelligence / holders / who-bought-sold / Nansen agent を使ってナラティブと精査精度を強化予定
+## 7. Performance Tracking / Result
 
-開発中は `USE_MOCK_NANSEN=true` にすることで、保存済みサンプルJSONを使ってNansenクレジットを消費せずに動作確認できます。Nansen結果は短時間キャッシュし、同じ確認で不要にAPIを叩かない設計です。
+後追い保存は維持します。
 
-`USE_MOCK_NANSEN=false` ではlive Nansen CLI / APIを使うため、Nansen creditsを消費します。本番テスト時は `/nansen-credits` で実行前の残量を確認し、`/meme-scan` / `/meme-deep-check` / `/dev-run-alert-check` などの実行後に本人向け表示と `/nansen-credit-logs` で差分を必ず確認してください。mock modeではlive Nansenを叩かないためcreditsは消費されません。
+保存タイミング:
 
-## Fresh Scan と Alert
+- 1h
+- 4h
+- 12h
+- 24h
+- 48h
+- 7d
 
-定時スキャンと `/meme-scan` は、固定ランキングではなく Fresh Scan 最大5件として投稿します。直近24時間以内に同じ `token_address` が `signals` に保存されている場合は原則再掲せず、条件を満たす候補が5件未満ならその件数だけ表示します。候補が0件の場合は、Fresh Scanでは強い新規候補がなかった旨をチャンネルに投稿します。
+保存するもの:
 
-Fresh Scanは小型初動を優先します。MCap $50K〜$2Mを中心に評価し、$2M〜$5Mは軽い減点、$5M〜$10Mは強めに減点、$10M以上は定時Fresh Scanでは原則除外します。Age 180日以上の古い銘柄は初動ではなく Re-Flow として扱い、Smart Money flowが明確に戻った場合だけ優先度を下げて検出します。
+- `entry_mcap`
+- `current_mcap`
+- `return_x`
+- `peak_return_x`
+- `time_to_peak`
+- `drawdown_after_peak`
+- `snapshot_label`
 
-Meme Edge Alertは、定時スキャンとは別に条件を満たした小型候補だけを投稿する仕組みです。Alert対象は必ず MCap $2M以下で、Meme Edge Score 75以上、Flow/MCap 3%以上、24h Flow $5K以上、Traders 3人以上を目安にします。同じ `token_address` は `alerts` を見て24時間以内に再Alertしません。
+通常の個別Result通知は出しません。Daily / Weekly / Monthly Recapに集約します。
 
-`/dev-run-alert-check` は開発・デモ用の手動Alert確認コマンドです。実行したチャンネルにAlert対象があれば投稿し、なければ実行者だけに「Alert条件を満たす候補はありませんでした」と返します。本番では1時間ごとのAlert Checkを想定していますが、Nansenクレジットを消費し得るため、頻度・キャッシュ・運用時間を確認してください。
+例外として、Alert投稿済みtokenがAlert後に `return_x >= 2.0` へ初到達した場合のみ、Alert Pump Hit通知を出します。Fresh Scan由来の2x到達は個別通知せず、Recapに集約します。
 
-AlertはMCap $2M以下などの一次条件だけでは投稿されません。候補ごとに自動Deep Checkを実行し、Quality Gateを通過したものだけ `🚨 Meme Edge Alert` として投稿します。Quality Gateでは Flow Quality / Holder Risk / Buyer-Seller Balance / Sell Pressure / Wallet Quality / Cluster Risk Lite を確認します。
+Alert Pump Hit表示例:
 
-Quality Gateの基本方針:
+```text
+🚀 Alert Pump Hit
 
-- Flow QualityがStrongまたはMedium
-- Holder RiskがHighではない
-- Buyer/Seller BalanceがBearishではない
-- Sell PressureがHighではない
-- Wallet QualityがMicro-arb偏重ではない
-- Cluster Risk LiteがHighではない
-- MCap $2M以下
+$TOKEN が Alert後に 2.10x 到達
 
-Quality Gateで落ちた候補はAlert投稿しません。`/dev-run-alert-check` ではDeep Check件数、通過件数、除外件数、主な除外理由を本人だけに返します。live Nansen利用時はAlert候補の自動Deep Check分も追加クレジットを消費する可能性があります。Quality Gateは投資助言ではなく、調査優先度を整理するための補助判定です。
+検出時MCap: $66.7K
+現在MCap: $140.2K
+到達時間: 4h
+Source: Alert
+CA: `xxxxxxxxxxxxxxxxxxxxxxxx`
 
-Signal Typeは、Scoreだけでは見えにくいシグナルの種類をカード上部とDBに保存する分類です。
+DexScreener / GMGN / UniversalX
+```
 
-- 🌱 Fresh Edge: Age 30日以内、MCap $2M以下、Flow/MCapが強い初動候補
-- 🚨 Alert Edge: Alert条件を満たした小型候補
-- 🔁 Re-Flow: Age 180日以上の古い銘柄に再びSmart Money flowが入った候補
-- 🐋 Whale Flow: 大型MCapに大きなflowが入った候補
-- ⚠️ Thin Liquidity: 少数TraderでFlow/MCapだけが高い薄い候補
-- 🤖 Bot-like Flow: 少数Traderかつ短期flow偏重の機械的な動きが疑われる候補
-- ❔ Unknown: まだ明確な分類に入らない候補
+同じtoken / 同じthresholdでは重複通知しません。5x / 10xは将来拡張用に判定・保存できますが、現時点の通知は2x到達が中心です。
 
-RecapのNansen Signal Reviewでは、Fresh Edge / Alert Edge / Re-Flow / Thin Liquidityの件数と平均成績を表示し、Signal Typeごとの傾向を振り返ります。
+## 8. Recap
 
-`/meme-recap` は単なる結果レポートではなく、次回スコア改善のためのLearning Layerとしても使います。過去の `signals` と `performance_snapshots` をもとに、条件別のreturn_xを集計し、Learning Summaryとして表示します。
+`/meme-recap` は短縮レポートです。
 
-Learning Summaryで見る条件:
+period:
 
-- Signal Type別: Fresh Edge / Alert Edge / Re-Flow / Whale Flow / Thin Liquidity / Bot-like Flow / Unknown
-- MCap帯別: $50K未満、$50K〜$500K、$500K〜$2M、$2M〜$5M、$5M〜$10M、$10M以上
-- Age帯別: 0〜1日、2〜7日、8〜30日、31〜180日、180日以上
-- Flow/MCap帯別: 0〜0.3%、0.3〜1%、1〜3%、3〜5%、5%以上
-- Cluster Risk別: Low / Medium / High / 未検証
-- Wallet Behavior別: Fresh Sniper / Accumulator / Fast Flipper / Micro-arb / Mirror-like / Unknown
+- `daily`
+- `weekly`
+- `monthly`
 
-Learning Summaryでは平均return_x、中央値、2x超え件数、Best tokenを短く表示します。Next Score Adjustmentでは、勝ちやすかった条件を優先し、弱かった条件の減点を強めるためのルールベース提案を出します。結果は `learning_summaries` table にJSON文字列として保存されます。これは自動売買判断ではなく、調査優先度とスコア改善の補助です。
+表示セクション:
 
-## Scoring Config
+- 📊 Bot成績
+- 🧠 学び
+- 🔍 注目パターン
+- 👥 Community
 
-`config/scoring.json` で、Meme Edge Score、Fresh Scan、Alert、Quality Gateの主要条件をコード変更なしで調整できます。このファイルは秘密情報を含まないためGitHubに含めてOKです。`.env` は引き続きGitHubに含めません。
+Optimizationはユーザー向けRecapには出しません。裏側のPDCAとして保存します。
 
-調整できる主な項目:
+Bot成績の表示形式:
 
-- `scoreWeights`: Flow/MCap、Smart Money Flow、MCap sweet spot、Freshness、Trader確認、Deep Check品質、Risk penaltyの重み
-- `mcapBuckets`: MCap帯ごとのscore、Fresh Scan許可、Alert許可
-- `ageBuckets`: Age帯ごとのscore、Fresh Edge / Re-Flowのヒント
-- `flowMcapBuckets`: Flow/MCap帯ごとのscore
-- `alertRules`: MCap上限、Score下限、Flow/MCap下限、24h Flow下限、Trader下限、dedupe時間、1回あたりAlert数
-- `freshScanRules`: Fresh Scanのdedupe時間、最大件数、MCap上限、Re-Flow許可
-- `qualityGate`: Holder Risk / Sell Pressure / Buyer-Seller / Cluster Risk / Flow Qualityの通過条件
-- `riskPenalties`: Thin Liquidity、Cluster Risk、Micro-arb、Mirror-like、Re-Flow、高MCapの減点
+```text
+📊 Bot成績
+候補数: 5
+2x: 0
+5x: 0
+10x: 0
+平均成績: 0.61x
+中央値: 0.80x
+Bot最高: $UNC 1.01x
+```
 
-運用では、`/meme-recap` の Learning Summary と Next Score Adjustment を見て、`config/scoring.json` を少しずつ調整します。設定ファイルが存在しない、または壊れている場合でもBotは落ちず、コード内の安全なデフォルト設定で動きます。これは自動売買ではなく、調査優先度とスコア改善を調整する仕組みです。
+Community表示:
 
-## Meme Deep Check
+```text
+Conviction: 1 / エアIN: 0 / Watch: 0
+```
 
-`/meme-deep-check token:<CA>` は、GH2012Telefe型の「CLI深掘り」に対応する精査用コマンドです。Research CardやAlertで気になったSolana token addressを指定すると、Nansenの `flow-intelligence` / `holders` / `who-bought-sold` / `dex-trades` を可能な範囲で取得し、候補の質を公開Embedで表示します。
+Leaderboard対象なしの場合は1行だけにします。
 
-表示内容:
+## 9. Commands
 
-- Flow Quality: Smart Money / Whale / Fresh Wallet flowの質
-- Holder Risk: Top holder集中、未売却holder、含み益holder、売り圧力
-- Buyer/Seller Balance: 買い手優勢か売り手優勢か
-- Sell Pressure: holders / who-bought-soldから見た売り圧力
-- Cluster Risk Lite: smart-money/dex-tradesから見た簡易cluster疑い
-- Wallet Quality Summary: Smart Money walletごとの行動品質
-- Final Note: 総合コメント
-- Confidence: High / Medium / Low
+ユーザー向け:
 
-`USE_MOCK_NANSEN=true` の場合はlive Nansenを叩かずmock / fallbackで動作します。`USE_MOCK_NANSEN=false` の場合、Deep Checkは追加のlive Nansen取得を行うためクレジットを消費する可能性があります。取得に失敗した項目はN/Aまたは未検証として扱い、コマンド全体は落とさずに表示します。
+- `/meme-scan`: Fresh Scanを手動実行。通常は投稿せず、候補保存とサマリー表示。`post:true` の時だけResearch Card投稿。
+- `/dev-run-alert-check`: Alertを手動実行。現状の手動Alert導線です。`/meme-alert` は未実装です。
+- `/meme-deep-check`: CA指定でDeep Check。
+- `/meme-results`: Bot候補の答え合わせ。
+- `/meme-recap`: daily / weekly / monthly の短縮レポート。
+- `/my`: 自分のPick履歴・成績。
+- `/leaderboard`: 全体ランキング。
+- `/nansen-credits`: Nansen credits確認。
+- `/nansen-credit-logs`: credits消費ログ。
+- `/meme-rules`: Conviction / エアIN / Watch のルール確認。
+- `/ping`: Bot疎通確認。
 
-Wallet Quality Summaryでは、smart-money/dex-tradesからwalletごとのbuy/sell回数、触ったtoken数、平均trade size、WSOL/SOL関連trade比率、target tokenの売買、近い時間帯のmirror buyを集計します。behavior_typeは以下のルールベース分類です。
+開発・検証用:
 
-- Fresh Sniper: token age 0〜1日のtokenを早期にbuyしやすいwallet
-- Accumulator: buyがsellより多く、target tokenを保有寄りに見えるwallet
-- Fast Flipper: buy後すぐsellする傾向、またはsell countが多いwallet
-- Micro-arb: WSOL/SOL関連trade比率が高く、平均trade sizeが小さく、trade countが多いwallet
-- Mirror-like: 他walletと近い時刻に似た金額で同じtokenをbuyするwallet
-- Unknown: 判定材料が少ないwallet
+- `/desk-test`: Nansen CLIのSmart Money netflow取得テスト。
+- `/dev-run-scheduled-scan`: 定時Fresh Scan相当を手動実行。
+- `/dev-run-alert-check`: Alert条件を手動確認。
+- `/dev-run-recap`: 定時Recap相当を手動実行。
+- `/dev-post-result`: 最新スキャンのResult投稿を手動再投稿。
+- `/dev-reset-me`: 自分の本日使用ポイントをリセット。
 
-Cluster Risk Liteは、2つ以上のwalletが同じtokenを同時刻または±2秒以内にbuyし、trade size差が20%以内のmirror buy / synchronized buyを簡易的に見ます。Mediumは2wallet程度の同期buy疑い、Highは3wallet以上やMicro-arb偏重が強い状態です。Sybil / bot cluster疑いを完全に確定するものではなく、Nansen dex-tradesからの簡易判定です。Duneやraw traceでのfunder一致確認までは行いません。将来的にDune/rawでfunder一致、同一sequence、bot / sybil cluster確認を追加予定です。
+dev系は開発・検証用で、通常ユーザー向けのメイン導線ではありません。
 
-live Nansen利用時は、Deep Check本体に加えてdex-trades / Wallet Quality解析分の追加クレジットを消費する可能性があります。
+## 10. Data Storage
 
-## Meme Edge Score
+主な保存テーブル:
 
-初期スコア配分:
+Fresh Scan:
 
-- Flow/MCap異常度: 30点
-- Smart Money Flow: 25点
-- Earlyness: 20点
-- Trader Confirmation: 15点
-- Risk Adjustment: 10点
+- `scan_runs`
+- `scan_candidates`
+- `candidate_performance_snapshots`
+- `candidate_peak_performance`
 
-Status:
+Alert:
 
-- Strong Edge
-- Watch
-- High-risk Speculative
-- Weak
+- `alert_runs`
+- `alert_candidates`
+- `alert_performance_snapshots`
+- `alert_peak_performance`
 
-## Commands
+User:
 
-- `/ping`: Botの疎通確認用。`pong`を返します。
-- `/desk-test`: Nansen CLI の Smart Money netflow 取得をテストします。
-- `/meme-scan`: Solana meme候補をスキャンし、Research Cardを投稿します。
-- `/meme-deep-check`: token addressを指定して、Flow Quality / Holder Risk / Buyer-Seller Balance / Cluster Risk Liteを深掘りします。
-- `/meme-rules`: Conviction / エアIN / Watch のPaper Pickルールを表示します。
-- `/meme-results`: 保存済みシグナルの成績を latest / daily / weekly / monthly で表示します。
-- `/my-picks`: 自分のPaper Pick履歴を today / weekly / monthly で確認します。
-- `/my-performance`: 自分のPaper Pick成績を daily / weekly / monthly で確認します。
-- `/leaderboard`: エアIN / Conviction のコミュニティランキングを表示します。
-- `/meme-recap`: Daily / Weekly / Monthly のBot・コミュニティ・Nansen Signal Reviewを表示します。
-- `/dev-reset-me`: 開発・デモ用。自分の本日使用ポイントをリセットします。
-- `/dev-post-result`: 開発・デモ用。最新スキャンの 1h / 6h / 24h Result を再投稿します。
-- `/dev-run-scheduled-scan`: 開発・デモ用。定時スキャンと同じ処理を任意チャンネルで実行します。
-- `/dev-run-alert-check`: 開発・デモ用。MCap $2M以下のMeme Edge Alert条件を手動確認します。
-- `/dev-run-recap`: 開発・デモ用。定時Recapと同じ処理を任意チャンネルで実行します。
-- `/nansen-credits`: 現在のNansen credits残量を本人だけに表示します。
-- `/nansen-credit-logs`: 直近のNansen credits使用履歴を本人だけに表示します。`limit` は最大20件です。
+- `users`
+- `user_picks`
 
-## 自動運用
+Results / Learning:
 
-JST基準で以下の定時投稿を行います。
+- `signals`
+- `recaps`
+- `learning_summaries`
+- `optimization_suggestions`
+- `optimization_experiments`
+- `optimization_results`
+- `config_versions`
 
-- 09:00 Morning Scan
-- 16:00 EU Open Scan
-- 23:00 US Prime Scan
-- 毎時05分 Alert Check
-- 09:30 Daily Recap
-- 日曜21:00 Weekly Recap
-- 毎月1日21:00 Monthly Recap
+Nansen:
 
-現在のスケジューラーは `setInterval` ベースの簡易実装です。Botプロセスが起動している間だけ有効で、再起動中・停止中の予定は実行されません。本番ではcron / persistent scheduler / job queueへの移行が望ましいです。
+- `nansen_credit_logs`
+- `deep_checks`
+- `wallet_quality_snapshots`
 
-## セットアップ
+Postgresを基本にしつつ、SQLite fallbackもあります。Nansen取得失敗やPostgres接続失敗でもBot全体を落とさない設計です。
+
+Fresh ScanとAlertは保存先を分けますが、`token_address` で横断分析できます。Fresh Scan only、Alert only、Both Fresh + Alert、Fresh rejected → Alert passed、Fresh Top候補 → Alert later、Alert first → Fresh laterなどを後から検証できます。
+
+## 11. Market Data補完
+
+Nansenのnetflowだけではprice / liquidityが不足する場合があります。そのためDexScreenerでmarket data補完を行います。
+
+補完対象:
+
+- `price`
+- `entry_price`
+- `liquidity`
+- `volume_24h`
+- `pairUrl`
+- `raw_dexscreener_snapshot`
+- `market_data_refreshed_at`
+- `market_data_warning`
+
+Fresh Scanでは、priceなしだけでGate 0 rejectにしません。warningとして保存し、MCap / Flow / Tradersを使って進めます。
+
+Alertでは、liquidity補完後にGate判定します。liquidity不足はAlertではReject理由になります。
+
+## 12. Nansen Credit運用
+
+Nansen取得モード:
+
+- `USE_MOCK_NANSEN=true`: mock / fallbackで動作。開発・UI確認用。
+- `USE_MOCK_NANSEN=false`: live Nansenを叩く。creditsを消費。
+
+クレジット消費の主な要因:
+
+- Broad Scan / Light Scan は比較的軽い
+- CLI Oracle / Deep Check は重い
+- Fresh ScanではCLI Oracleを通常OFF
+- Alertでは強候補のみCLI Oracleを使用
+
+実測から見えたこと:
+
+- 以前はFresh ScanのCLI Oracle 10件で大きくcreditsを消費していた
+- 現在はFresh ScanのCLI OracleをOFFにし、Alert側へ優先的に使う設計
+- `nansen_credit_logs` で消費を保存する
+
+今後はCredit Budget Gateを追加し、1日あたり・1runあたりの消費上限、CLI Oracle実行可否、Deep Check対象数をより明確に制御する予定です。
+
+## 13. Environment / Setup
+
+必要なもの:
+
+- Node.js
+- npm
+- Discord Bot Token
+- Discord Client ID
+- Nansen API Key
+- `USE_MOCK_NANSEN`
+- `DATABASE_URL` optional
+- SQLite fallback
+
+セットアップ:
 
 ```bash
 npm install
-cp .env.example .env
+npm run check
+npx tsc --noEmit
 npm run dev
 ```
 
-`.env` にDiscordとNansenの設定を入れます。
+`.env` に設定します。
 
 - `DISCORD_TOKEN`: Discord Bot token
 - `DISCORD_CLIENT_ID`: Discord application client id
 - `NANSEN_API_KEY`: Nansen CLI / APIで使うAPI key
-- `USE_MOCK_NANSEN`: Nansen取得モードの切替
-- `MEME_EDGE_CHANNEL_ID`: 定時スキャン・定時Recapの投稿先チャンネルID
+- `USE_MOCK_NANSEN`: `true` ならmock、`false` ならlive
+- `MEME_EDGE_CHANNEL_ID`: 定時Alert / Recapなどの対象チャンネルID
+- `DATABASE_URL`: Postgresを使う場合のみ設定。未設定でもSQLite fallbackで動作
 
-開発・デモ時は `USE_MOCK_NANSEN=true` でmock/cacheを使えます。本番確認時は `USE_MOCK_NANSEN=false` にしてlive Nansenを使います。live modeでは `/desk-test`、`/meme-scan`、`/dev-run-scheduled-scan`、`/dev-run-alert-check`、`/meme-deep-check`、定時スキャン、定時Alert Checkの実行前後にcredits残量を記録します。記録はSQLiteの `nansen_credit_logs` に保存され、実行前credits、実行後credits、今回消費credits、mock/live区分、実行時刻を確認できます。
+開発・UI確認では `USE_MOCK_NANSEN=true` を推奨します。本番確認では `USE_MOCK_NANSEN=false` にし、`/nansen-credits` と `/nansen-credit-logs` で実行前後のcreditsを確認します。
 
-## データソース
+## 14. Current UX Summary
 
-- Nansen: Smart Money / Flow / Signal
-- DexScreener: price / MCap / token icon / chart link
-- GMGN: Solana token research link
-- UniversalX: trade link
+現在ユーザーが見る主な体験:
 
-## 安全性
+- Alertが強候補を通知
+- ユーザーは Conviction / エアIN / Watch を押す
+- `/my` で自分の成績を見る
+- `/leaderboard` でランキングを見る
+- `/meme-recap` で日次・週次・月次の答え合わせを見る
+
+裏側:
+
+- Fresh Scanが市場データを保存
+- 後追いtrackingが成績を更新
+- PDCA用データを蓄積
+- Alert精度改善に使う
+
+Fresh Scanは裏側のPDCA、Alertは表側の通知です。Recapは答え合わせ、User Picksは参加型の発見ゲームです。
+
+## 15. Safety / Notes
 
 - 投資助言として表示しない
 - 実取引を実行しない
@@ -298,33 +460,30 @@ npm run dev
 - 秘密鍵なし
 - APIキーは `.env` で管理し、コードに直書きしない
 - `.env` はGitに含めない
-- 取得データが不足する場合はN/Aや低confidenceとして扱う
+- データ不足時もBot全体を落とさず、取れた材料から表示・保存する
 - Paper Pickは調査・学習・振り返り用
-
-## AI利用開示
 
 開発AI:
 
-- OpenAI ChatGPT / Codex を仕様整理、実装支援、UI文言調整、TypeScript修正に使用
+- OpenAI ChatGPT / Codexを仕様整理、実装支援、UI文言調整、TypeScript修正に使用
 
 ランタイムAI:
 
 - 現時点では必須ではありません。
 - 将来的にNarrative ResolverやNansen Signal Reviewの要約でAIを使う場合は、プロバイダー、モデル、ガードレール、フォールバックを明記します。
 
+## 16. 今後の改善
+
+- Credit Budget Gate
+- 本番用persistent scheduler
+- Optimization Suggestionsの評価UI
+- Alert Quality Gateの継続改善
+- Dune / raw traceによるcluster確認強化
+- Nansen agentによる深掘り調査
+- Monthly report強化
+
 ## 免責
 
 これは投資助言ではありません。
 Nansenデータに基づく調査補助・Paper Pick・振り返り用Botです。
 実際の売買判断はユーザー自身の責任です。
-
-## 今後の改善
-
-- Narrative Resolver強化
-- Nansen token info / flow-intelligence / holders / who-bought-sold連携
-- Deep Check強化: Dune/rawでfunder一致、同一sequence、bot / sybil cluster確認を追加
-- Nansen agentによる深掘り調査
-- 本番用scheduler
-- PostgreSQL移行
-- より高度なNansen Signal Review
-- Monthly report強化

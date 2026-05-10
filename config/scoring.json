@@ -64,36 +64,19 @@
       "label": "0〜1日",
       "minDays": 0,
       "maxDays": 1,
-      "score": 15,
-      "signalTypeHint": "fresh_edge"
+      "score": 10
     },
     {
-      "label": "2〜7日",
-      "minDays": 2,
-      "maxDays": 7,
-      "score": 14,
-      "signalTypeHint": "fresh_edge"
+      "label": "1〜5日",
+      "minDays": 1,
+      "maxDays": 5,
+      "score": 8
     },
     {
-      "label": "8〜30日",
-      "minDays": 8,
-      "maxDays": 30,
-      "score": 10,
-      "signalTypeHint": "fresh_edge"
-    },
-    {
-      "label": "31〜180日",
-      "minDays": 31,
-      "maxDays": 180,
-      "score": 5,
-      "signalTypeHint": "unknown"
-    },
-    {
-      "label": "180日以上",
-      "minDays": 181,
+      "label": "5日以上",
+      "minDays": 5,
       "maxDays": null,
-      "score": 1,
-      "signalTypeHint": "re_flow"
+      "score": 4
     }
   ],
   "flowMcapBuckets": [
@@ -129,19 +112,90 @@
     }
   ],
   "alertRules": {
+    "intervalMinutes": 5,
+    "candidatePoolSize": 300,
+    "nansenCandidateSize": 240,
+    "freshScanDbCandidateSize": 40,
+    "watchCandidateSize": 20,
+    "preFilterSize": 15,
+    "cliOracleCheckSize": 5,
+    "maxAlertsPerRun": 3,
+    "minMcap": 30000,
     "maxMcap": 2000000,
+    "minLiquidityUsd": 40000,
     "minScore": 75,
-    "minFlowMcap": 0.03,
     "min24hFlowUsd": 5000,
+    "minFlowMcap": 0.03,
     "minTraders": 3,
-    "preferMaxAgeDays": 30,
+    "min1hFlowUsd": 1500,
+    "min4hFlowUsd": 3000,
+    "shortTermFlowOptional": true,
+    "maxMarketDataAgeMinutes": 10,
+    "freshScanLookbackHours": 24,
+    "watchCandidateLookbackHours": 48,
+    "maxFreshScanDbCandidatesInPreFilter": 5,
+    "maxWatchCandidatesInPreFilter": 3,
+    "requireCliDeepCheck": true,
+    "requireDexTradesCheck": true,
+    "requireQualityGatePass": true,
     "dedupeHours": 24,
-    "maxAlertsPerRun": 3
+    "maxRiskSignalsPerRun": 0,
+    "saveAllCandidates": true,
+    "trackAllCandidates": true,
+    "freshnessScore": {
+      "maxPoints": 10,
+      "buckets": [
+        { "maxMinutes": 15, "score": 10 },
+        { "maxMinutes": 60, "score": 7 },
+        { "maxMinutes": 360, "score": 4 },
+        { "maxMinutes": 1440, "score": 2 },
+        { "maxMinutes": null, "score": 0 }
+      ]
+    },
+    "reaccelerationRules": {
+      "enabled": true,
+      "minMcapMultipleFromSource": 1.5,
+      "minFlow24hMultipleFromSource": 1.5,
+      "minTradersMultipleFromSource": 1.5,
+      "allowCliGradeImprovement": true
+    },
+    "reAlert": {
+      "enabled": true,
+      "minHoursSinceLastAlert": 4,
+      "mcapMultipleFromLastAlert": 2,
+      "flow24hMultipleFromLastAlert": 2,
+      "tradersMultipleFromLastAlert": 2,
+      "allowCliGradeImprovement": true
+    },
+    "preferMaxAgeDays": 30
   },
   "freshScanRules": {
-    "dedupeHours": 24,
+    "mode": "data_collection",
+    "postTopSignals": false,
+    "candidatePoolSize": 1500,
+    "momentumGateSize": 150,
+    "preFilterSize": 25,
+    "cliOracleCheckSize": 0,
     "maxSignalsPerRun": 5,
-    "maxMcap": 10000000,
+    "dedupeHours": 24,
+    "useCliOracle": true,
+    "maxCliCreditsPerRun": 150,
+    "minMcap": 30000,
+    "maxMcap": 50000000,
+    "allowAboveMaxMcapIfStrong": true,
+    "minLiquidityUsd": 20000,
+    "min24hFlowUsd": 1000,
+    "minFlowMcap": 0.003,
+    "minTraders": 2,
+    "largeMcapThreshold": 10000000,
+    "maxLargeMcapPerRun": 2,
+    "maxPerSignalType": 4,
+    "maxRiskSignalsPerRun": 1,
+    "replacementScoreTolerance": 5,
+    "forceDiversity": false,
+    "saveAllCandidates": true,
+    "trackAllCandidates": true,
+    "excludeClusterRiskHigh": true,
     "preferMaxMcap": 2000000,
     "preferMaxAgeDays": 30,
     "allowReFlowIfStrong": true

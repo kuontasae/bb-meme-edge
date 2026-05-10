@@ -15,7 +15,14 @@ const { readFileSync } = require("node:fs") as typeof import("node:fs");
 const { readFile } = require("node:fs/promises") as typeof import("node:fs/promises");
 const path = require("node:path") as typeof import("node:path");
 const { promisify } = require("node:util") as typeof import("node:util");
-const { DB_PATH, initDatabase } = require("./db") as typeof import("./db");
+const {
+  DB_PATH,
+  buildAlertPostgresStore,
+  buildAlertSqliteStore,
+  buildFreshScanPostgresStore,
+  buildFreshScanSqliteStore,
+  initDatabase,
+} = require("./db") as typeof import("./db");
 
 const {
   ActionRowBuilder,
@@ -31,7 +38,9 @@ const {
 
 const execFileAsync = promisify(execFile);
 const NANSEN_CACHE_TTL_MS = 5 * 60 * 1000;
+const NANSEN_NETFLOW_PAGE_LIMIT = 1000;
 const MEME_EDGE_CHANNEL_ID = process.env.MEME_EDGE_CHANNEL_ID;
+const AUTO_POST_RESULTS_ENABLED = process.env.AUTO_POST_RESULTS === "true";
 const SOLANA_NETFLOW_SAMPLE_PATH = path.join(
   process.cwd(),
   "data",
@@ -58,7 +67,12 @@ const commands = [
     .toJSON(),
   new SlashCommandBuilder()
     .setName("meme-scan")
-    .setDescription("Solana meme候補のResearch Cardを表示します")
+    .setDescription("Fresh Scanを手動実行し、候補を保存します")
+    .addBooleanOption((option) =>
+      option
+        .setName("post")
+        .setDescription("trueのときだけTop候補をResearch Cardとして投稿します"),
+    )
     .toJSON(),
   new SlashCommandBuilder()
     .setName("meme-deep-check")
@@ -90,7 +104,7 @@ const commands = [
         ),
     )
     .toJSON(),
-  new SlashCommandBuilder()
+ new SlashCommandBuilder()
     .setName("meme-recap")
     .setDescription("Daily / Weekly / Monthly のMeme Edge振り返りを表示します")
     .addStringOption((option) =>
@@ -106,38 +120,12 @@ const commands = [
     )
     .toJSON(),
   new SlashCommandBuilder()
-    .setName("my-picks")
-    .setDescription("自分のPaper Pick履歴を表示します")
-    .addStringOption((option) =>
-      option
-        .setName("period")
-        .setDescription("表示する期間")
-        .setRequired(false)
-        .addChoices(
-          { name: "today", value: "today" },
-          { name: "weekly", value: "weekly" },
-          { name: "monthly", value: "monthly" },
-        ),
-    )
+    .setName("my")
+    .setDescription("自分のPick履歴と成績をまとめて表示します")
     .toJSON(),
   new SlashCommandBuilder()
     .setName("leaderboard")
     .setDescription("エアIN / Convictionのコミュニティランキングを表示します")
-    .addStringOption((option) =>
-      option
-        .setName("period")
-        .setDescription("集計期間")
-        .setRequired(false)
-        .addChoices(
-          { name: "daily", value: "daily" },
-          { name: "weekly", value: "weekly" },
-          { name: "monthly", value: "monthly" },
-        ),
-    )
-    .toJSON(),
-  new SlashCommandBuilder()
-    .setName("my-performance")
-    .setDescription("自分のPaper Pick成績を表示します")
     .addStringOption((option) =>
       option
         .setName("period")
@@ -243,6 +231,8 @@ type NetflowRow = {
   image?: unknown;
   logo_url?: unknown;
   logoURI?: unknown;
+  dexscreener_url?: unknown;
+  dexscreenerUrl?: unknown;
   metadata?: unknown;
   token_metadata?: unknown;
 };
@@ -251,11 +241,103 @@ type NansenDataSource = "mock" | "cache" | "live";
 type NansenFetchMode = "mock" | "live";
 type MemeStatus = "🟢 Strong Edge" | "🟡 Watch" | "🟠 High-risk Speculative" | "🔴 Weak";
 
+type NansenFetchMetadata = {
+  requestedCandidatePoolSize: number;
+  actualCandidatePoolSize: number;
+  nansenPageLimit: number;
+  nansenPaginationUsed: boolean;
+  nansenFetchWarning: string | null;
+};
+
 type CachedNansenResult = {
   rows: NetflowRow[];
+  metadata: NansenFetchMetadata;
   mode: NansenFetchMode;
   expiresAt: number;
 };
+
+type CachedTokenInformationResult = {
+  value: TokenInformationSnapshot | null;
+  mode: NansenFetchMode;
+  expiresAt: number;
+};
+
+type NarrativeConfidence = "High" | "Medium" | "Low";
+type NarrativeType =
+  | "animal"
+  | "celebrity"
+  | "ai"
+  | "gaming"
+  | "political"
+  | "sports"
+  | "anime"
+  | "brand"
+  | "space"
+  | "aquatic"
+  | "pump_fun"
+  | "abstract"
+  | "flow_driven"
+  | "unknown";
+
+type NarrativeSocialLinks = {
+  website?: string | undefined;
+  twitter?: string | undefined;
+  telegram?: string | undefined;
+  dexscreener?: string | undefined;
+  gmgn?: string | undefined;
+  universalx?: string | undefined;
+  xSearch?: string | undefined;
+};
+
+type TokenInformationSnapshot = {
+  tokenAddress: string;
+  name: string | null;
+  symbol: string | null;
+  description: string | null;
+  logoUrl: string | null;
+  deploymentDate: string | null;
+  websiteUrl: string | null;
+  twitterUrl: string | null;
+  telegramUrl: string | null;
+  marketCap: number | null;
+  fdv: number | null;
+  volume: number | null;
+  buys: number | null;
+  sells: number | null;
+  uniqueTraders: number | null;
+  liquidity: number | null;
+  holders: number | null;
+  raw: unknown;
+};
+
+type TokenProfileContext = {
+  source: "DexScreener" | "GMGN" | "token metadata";
+  description: string | null;
+  imageUrl: string | null;
+  links: NarrativeSocialLinks;
+};
+
+type TokenNarrative = {
+  narrativeSummary: string;
+  narrativeType: NarrativeType;
+  narrativeSources: string[];
+  narrativeEvidence: string[];
+  narrativeTags: string[];
+  socialLinks: NarrativeSocialLinks;
+  internalConfidence: NarrativeConfidence;
+};
+
+function createHiddenTokenNarrative(): TokenNarrative {
+  return {
+    narrativeSummary: "",
+    narrativeType: "unknown",
+    narrativeSources: [],
+    narrativeEvidence: [],
+    narrativeTags: [],
+    socialLinks: {},
+    internalConfidence: "Low",
+  };
+}
 
 type ScoreBreakdown = {
   flowMcap: number;
@@ -286,7 +368,6 @@ type AgeScoringBucket = {
   minDays: number;
   maxDays: number | null;
   score: number;
-  signalTypeHint: string;
 };
 
 type ScoringConfig = {
@@ -304,18 +385,83 @@ type ScoringConfig = {
   ageBuckets: AgeScoringBucket[];
   flowMcapBuckets: ScoringBucket[];
   alertRules: {
+    intervalMinutes: number;
+    candidatePoolSize: number;
+    nansenCandidateSize: number;
+    freshScanDbCandidateSize: number;
+    watchCandidateSize: number;
+    preFilterSize: number;
+    cliOracleCheckSize: number;
+    minMcap: number;
     maxMcap: number;
+    minLiquidityUsd: number;
     minScore: number;
     minFlowMcap: number;
     min24hFlowUsd: number;
     minTraders: number;
+    min1hFlowUsd: number;
+    min4hFlowUsd: number;
+    shortTermFlowOptional: boolean;
+    maxMarketDataAgeMinutes: number;
+    freshScanLookbackHours: number;
+    watchCandidateLookbackHours: number;
+    maxFreshScanDbCandidatesInPreFilter: number;
+    maxWatchCandidatesInPreFilter: number;
+    requireCliDeepCheck: boolean;
+    requireDexTradesCheck: boolean;
+    requireQualityGatePass: boolean;
     preferMaxAgeDays: number;
     dedupeHours: number;
+    maxRiskSignalsPerRun: number;
+    saveAllCandidates: boolean;
+    trackAllCandidates: boolean;
+    freshnessScore: {
+      maxPoints: number;
+      buckets: Array<{ maxMinutes: number | null; score: number }>;
+    };
+    reaccelerationRules: {
+      enabled: boolean;
+      minMcapMultipleFromSource: number;
+      minFlow24hMultipleFromSource: number;
+      minTradersMultipleFromSource: number;
+      allowCliGradeImprovement: boolean;
+    };
+    reAlert: {
+      enabled: boolean;
+      minHoursSinceLastAlert: number;
+      mcapMultipleFromLastAlert: number;
+      flow24hMultipleFromLastAlert: number;
+      tradersMultipleFromLastAlert: number;
+      allowCliGradeImprovement: boolean;
+    };
     maxAlertsPerRun: number;
   };
   freshScanRules: {
+    mode: "posting" | "data_collection";
+    postTopSignals: boolean;
+    candidatePoolSize: number;
+    momentumGateSize: number;
+    preFilterSize: number;
+    cliOracleCheckSize: number;
     dedupeHours: number;
+    useCliOracle: boolean;
+    maxCliCreditsPerRun: number;
+    minMcap: number;
     maxSignalsPerRun: number;
+    allowAboveMaxMcapIfStrong: boolean;
+    minLiquidityUsd: number;
+    min24hFlowUsd: number;
+    minFlowMcap: number;
+    minTraders: number;
+    largeMcapThreshold: number;
+    maxLargeMcapPerRun: number;
+    maxPerSignalType: number;
+    maxRiskSignalsPerRun: number;
+    replacementScoreTolerance: number;
+    forceDiversity: boolean;
+    saveAllCandidates: boolean;
+    trackAllCandidates: boolean;
+    excludeClusterRiskHigh: boolean;
     maxMcap: number;
     preferMaxMcap: number;
     preferMaxAgeDays: number;
@@ -342,13 +488,11 @@ type ScoringConfig = {
 };
 
 type SignalType =
-  | "🌱 Fresh Edge"
-  | "🚨 Alert Edge"
-  | "🔁 Re-Flow"
-  | "🐋 Whale Flow"
-  | "⚠️ Thin Liquidity"
-  | "🤖 Bot-like Flow"
-  | "❔ Unknown";
+  | "alert_edge"
+  | "flow_watch"
+  | "whale_flow"
+  | "thin_liquidity"
+  | "bot_like_flow";
 
 type MemeResearchCard = {
   signalId: string;
@@ -357,6 +501,12 @@ type MemeResearchCard = {
   symbol: string;
   name: string;
   narrative: string;
+  narrativeSummary: string;
+  narrativeType: NarrativeType;
+  narrativeSources: string;
+  narrativeEvidence: string;
+  narrativeTags: string;
+  narrativeConfidence: NarrativeConfidence;
   signalType: SignalType;
   edgeScore: number;
   status: MemeStatus;
@@ -384,6 +534,10 @@ type MemeResearchCard = {
 type DexScreenerTokenPair = {
   info?: {
     imageUrl?: unknown;
+    header?: unknown;
+    openGraph?: unknown;
+    websites?: unknown;
+    socials?: unknown;
   };
   baseToken?: {
     address?: unknown;
@@ -396,6 +550,10 @@ type DexScreenerTokenPair = {
   marketCap?: unknown;
   fdv?: unknown;
   priceUsd?: unknown;
+  volume?: {
+    h24?: unknown;
+  };
+  url?: unknown;
 };
 
 type DeepCheckSourceName = "flow-intelligence" | "holders" | "who-bought-sold" | "dex-trades";
@@ -439,6 +597,7 @@ type DeepCheckReply = {
   sellPressure: DeepCheckTextResult<DeepCheckRisk>;
   clusterRisk: DeepCheckTextResult<DeepCheckClusterRisk>;
   walletQuality: WalletQualityAnalysis;
+  narrative: TokenNarrative;
   finalNote: string;
   confidence: DeepCheckConfidence;
   rawSummary: string;
@@ -483,6 +642,7 @@ type AlertCheckPosted = {
   card: MemeResearchCard;
   deepCheck: DeepCheckReply;
   gate: AlertQualityGateResult;
+  candidate?: AlertV2Candidate;
 };
 
 type AlertCheckResult = {
@@ -493,6 +653,85 @@ type AlertCheckResult = {
     deepCheck: DeepCheckReply;
     gate: AlertQualityGateResult;
   }>;
+};
+
+type AlertCandidateSourceType =
+  | "nansen_new"
+  | "fresh_scan_reaccelerated"
+  | "watch_reaccelerated"
+  | "cli_near_miss_recheck";
+
+type AlertV2Candidate = {
+  alertRunId: string;
+  tokenAddress: string;
+  symbol: string;
+  name: string;
+  candidateRank: number;
+  candidateSourceType: AlertCandidateSourceType;
+  candidateSources: AlertCandidateSourceType[];
+  sourceQuotaBucket: string;
+  sourcePriority: number;
+  sourceDetectedAt: string;
+  candidateFreshnessMinutes: number;
+  marketDataRefreshedAt: string;
+  marketDataAgeMinutes: number;
+  marketDataSource: string | null;
+  marketDataWarning: string | null;
+  fromFreshScanId: string | null;
+  fromScanCandidateId: string | null;
+  fromPreviousAlertRunId: string | null;
+  fromWatchPickId: string | null;
+  isReaccelerated: boolean;
+  reaccelerationReason: string | null;
+  marketCap: number | null;
+  price: number | null;
+  ageDays: number | null;
+  liquidity: number | null;
+  volume24h: number | null;
+  flow1h: number | null;
+  flow4h: number | null;
+  flow24h: number | null;
+  flow7d: number | null;
+  flowMcapRatio: number | null;
+  traderCount: number | null;
+  gate0Status: "pass" | "reject";
+  gate0Reason: string;
+  alertMomentumScore: number;
+  alertMomentumComponents: Record<string, number>;
+  preFilterStatus: "pass" | "fail";
+  preFilterRank: number | null;
+  preFilterReason: string;
+  cliChecked: boolean;
+  cliGrade: CliGrade;
+  cliOracleStatus: string;
+  rawCliSummary: string | null;
+  flowQuality: string | null;
+  holderRisk: string | null;
+  buyerSellerBalance: string | null;
+  sellPressure: string | null;
+  walletQuality: string | null;
+  clusterRisk: string | null;
+  qualityGateGrade: AlertQualityGateGrade | null;
+  qualityGateReasons: string[];
+  qualityGateWarnings: string[];
+  positiveFlags: string[];
+  riskFlags: string[];
+  warningFlags: string[];
+  passReasonCodes: string[];
+  rejectReasonCodes: string[];
+  rankBucket: string | null;
+  finalRank: number | null;
+  posted: boolean;
+  postedMessageId: string | null;
+  entryMcap: number | null;
+  entryPrice: number | null;
+  rawDexscreenerSnapshot: unknown;
+  createdAt: string;
+  card: MemeResearchCard;
+  deepCheck?: DeepCheckReply;
+  gate?: AlertQualityGateResult;
+  isRealert: boolean;
+  realertReason: string | null;
 };
 
 const DEFAULT_SCORING_CONFIG: ScoringConfig = {
@@ -515,11 +754,9 @@ const DEFAULT_SCORING_CONFIG: ScoringConfig = {
     { label: "$10M以上", min: 10_000_000, max: null, score: 0, freshScanAllowed: false, alertAllowed: false },
   ],
   ageBuckets: [
-    { label: "0〜1日", minDays: 0, maxDays: 1, score: 15, signalTypeHint: "fresh_edge" },
-    { label: "2〜7日", minDays: 2, maxDays: 7, score: 14, signalTypeHint: "fresh_edge" },
-    { label: "8〜30日", minDays: 8, maxDays: 30, score: 10, signalTypeHint: "fresh_edge" },
-    { label: "31〜180日", minDays: 31, maxDays: 180, score: 5, signalTypeHint: "unknown" },
-    { label: "180日以上", minDays: 181, maxDays: null, score: 1, signalTypeHint: "re_flow" },
+    { label: "0〜1日", minDays: 0, maxDays: 1, score: 10 },
+    { label: "1〜5日", minDays: 1, maxDays: 5, score: 8 },
+    { label: "5日以上", minDays: 5, maxDays: null, score: 4 },
   ],
   flowMcapBuckets: [
     { label: "0〜0.3%", min: 0, max: 0.003, score: 2 },
@@ -529,19 +766,90 @@ const DEFAULT_SCORING_CONFIG: ScoringConfig = {
     { label: "5%以上", min: 0.05, max: null, score: 20 },
   ],
   alertRules: {
+    intervalMinutes: 5,
+    candidatePoolSize: 300,
+    nansenCandidateSize: 240,
+    freshScanDbCandidateSize: 40,
+    watchCandidateSize: 20,
+    preFilterSize: 15,
+    cliOracleCheckSize: 5,
+    minMcap: 30_000,
     maxMcap: 2_000_000,
+    minLiquidityUsd: 40_000,
     minScore: 75,
     minFlowMcap: 0.03,
     min24hFlowUsd: 5_000,
     minTraders: 3,
+    min1hFlowUsd: 1_500,
+    min4hFlowUsd: 3_000,
+    shortTermFlowOptional: true,
+    maxMarketDataAgeMinutes: 10,
+    freshScanLookbackHours: 24,
+    watchCandidateLookbackHours: 48,
+    maxFreshScanDbCandidatesInPreFilter: 5,
+    maxWatchCandidatesInPreFilter: 3,
+    requireCliDeepCheck: true,
+    requireDexTradesCheck: true,
+    requireQualityGatePass: true,
     preferMaxAgeDays: 30,
     dedupeHours: 24,
+    maxRiskSignalsPerRun: 0,
+    saveAllCandidates: true,
+    trackAllCandidates: true,
+    freshnessScore: {
+      maxPoints: 10,
+      buckets: [
+        { maxMinutes: 15, score: 10 },
+        { maxMinutes: 60, score: 7 },
+        { maxMinutes: 360, score: 4 },
+        { maxMinutes: 1440, score: 2 },
+        { maxMinutes: null, score: 0 },
+      ],
+    },
+    reaccelerationRules: {
+      enabled: true,
+      minMcapMultipleFromSource: 1.5,
+      minFlow24hMultipleFromSource: 1.5,
+      minTradersMultipleFromSource: 1.5,
+      allowCliGradeImprovement: true,
+    },
+    reAlert: {
+      enabled: true,
+      minHoursSinceLastAlert: 4,
+      mcapMultipleFromLastAlert: 2,
+      flow24hMultipleFromLastAlert: 2,
+      tradersMultipleFromLastAlert: 2,
+      allowCliGradeImprovement: true,
+    },
     maxAlertsPerRun: 3,
   },
   freshScanRules: {
+    mode: "data_collection",
+    postTopSignals: false,
+    candidatePoolSize: 1500,
+    momentumGateSize: 150,
+    preFilterSize: 25,
+    cliOracleCheckSize: 0,
     dedupeHours: 24,
+    useCliOracle: true,
+    maxCliCreditsPerRun: 150,
+    minMcap: 30_000,
     maxSignalsPerRun: 5,
-    maxMcap: 10_000_000,
+    maxMcap: 50_000_000,
+    allowAboveMaxMcapIfStrong: true,
+    minLiquidityUsd: 20_000,
+    min24hFlowUsd: 1_000,
+    minFlowMcap: 0.003,
+    minTraders: 2,
+    largeMcapThreshold: 10_000_000,
+    maxLargeMcapPerRun: 2,
+    maxPerSignalType: 4,
+    maxRiskSignalsPerRun: 1,
+    replacementScoreTolerance: 5,
+    forceDiversity: false,
+    saveAllCandidates: true,
+    trackAllCandidates: true,
+    excludeClusterRiskHigh: true,
     preferMaxMcap: 2_000_000,
     preferMaxAgeDays: 30,
     allowReFlowIfStrong: true,
@@ -613,7 +921,7 @@ type MemeScanReply = {
 };
 
 type PickAction = "watch" | "paper_in" | "conviction";
-type AlertType = "fresh_edge" | "re_flow";
+type AlertType = "alert_edge";
 type MemeResultsPeriod = "latest" | "daily" | "weekly" | "monthly";
 type MemeRecapPeriod = "daily" | "weekly" | "monthly";
 type MemeScanLabel = "Morning Scan" | "EU Open Scan" | "US Prime Scan" | "Manual Scan";
@@ -625,10 +933,19 @@ type PerformancePeriod = "daily" | "weekly" | "monthly";
 
 type SignalRecord = {
   signal_id: string;
+  scan_id?: string | null;
   token_address: string;
   symbol: string | null;
+  name?: string | null;
+  signal_type?: string | null;
+  scan_time?: string | null;
   scan_mcap: number | null;
   scan_price: number | null;
+  flow_24h?: number | null;
+  flow_7d?: number | null;
+  flow_mcap_ratio?: number | null;
+  trader_count?: number | null;
+  token_age?: string | null;
   message_id: string | null;
   channel_id: string | null;
 };
@@ -689,6 +1006,25 @@ type UserPickWithSignalRecord = UserPickRecord & {
 type DexScreenerMarketData = {
   marketCap: number | null;
   price: number | null;
+  liquidity: number | null;
+  volume24h: number | null;
+  pairUrl: string | null;
+  raw?: unknown;
+};
+
+type MarketDataEnrichment = {
+  marketCap: number | null;
+  price: number | null;
+  entryPrice: number | null;
+  liquidity: number | null;
+  volume24h: number | null;
+  pairUrl: string | null;
+  refreshedAt: string;
+  ageMinutes: number;
+  source: string | null;
+  warning: string | null;
+  warningFlags: string[];
+  rawSnapshot: unknown;
 };
 
 type SignalPerformance = {
@@ -751,10 +1087,8 @@ type MemeRecapSummary = {
   botSummary: string;
   communitySummary: string;
   leaderboardSummary: string;
-  narrativeSummary: string;
   nansenSignalReview: string;
   learningSummary: string;
-  nextAdjustment: string;
 };
 
 type DeepCheckRecord = {
@@ -819,6 +1153,64 @@ type MemeScanResult = {
   scanTime: string;
   source: NansenDataSource;
   signalIds: string[];
+  candidateCount: number;
+  gate0PassCount: number;
+  momentumGatePassCount: number;
+  preFilterPassCount: number;
+  postTopSignals: boolean;
+};
+
+type CliGrade = "A" | "B" | "C" | "Reject" | "Unchecked";
+
+type FreshScanCandidate = {
+  scanId: string;
+  candidateRank: number;
+  row: NetflowRow;
+  tokenAddress: string;
+  symbol: string;
+  name: string;
+  candidateSources: string[];
+  marketCap: number | null;
+  price: number | null;
+  liquidity: number | null;
+  volume24h: number | null;
+  marketDataRefreshedAt: string | null;
+  marketDataAgeMinutes: number | null;
+  marketDataSource: string | null;
+  marketDataWarning: string | null;
+  flow24h: number | null;
+  flow7d: number | null;
+  flowMcapRatio: number | null;
+  traderCount: number | null;
+  ageDays: number | null;
+  warningFlags: string[];
+  rawDexscreenerSnapshot: unknown;
+  gate0Status: "pass" | "reject";
+  gate0Reason: string;
+  hardRejectStatus: "pass" | "reject" | "penalized";
+  hardRejectReason: string;
+  riskFlags: string[];
+  momentumScore: number;
+  momentumGateStatus: "pass" | "fail";
+  momentumGateReason: string;
+  rankComponents: Record<string, number>;
+  preFilterStatus: "pass" | "fail";
+  preFilterRank: number | null;
+  preFilterReason: string;
+  cliCandidateScore: number;
+  whySelectedForCli: string | null;
+  cliChecked: boolean;
+  cliGrade: CliGrade;
+  cliOracleStatus: string;
+  cliRejectReason: string | null;
+  finalRank: number | null;
+  finalRankReason: string | null;
+  posted: boolean;
+  postedMessageId: string | null;
+  score: number;
+  signalType: SignalType;
+  exclusionReason: string | null;
+  createdAt: string;
 };
 
 type SendableChannel = {
@@ -839,7 +1231,91 @@ type MemeScanPostContext = {
 };
 
 let cachedNansenResult: CachedNansenResult | undefined;
+const cachedTokenInformation = new Map<string, CachedTokenInformationResult>();
 const db = initDatabase();
+const sqliteFreshScanStore = buildFreshScanSqliteStore(db);
+const postgresFreshScanStore = process.env.DATABASE_URL ? buildFreshScanPostgresStore(process.env.DATABASE_URL) : null;
+const sqliteAlertStore = buildAlertSqliteStore(db);
+const postgresAlertStore = process.env.DATABASE_URL ? buildAlertPostgresStore(process.env.DATABASE_URL) : null;
+const freshScanStore = {
+  provider: postgresFreshScanStore?.provider ?? sqliteFreshScanStore.provider,
+  async saveRun(run: Parameters<typeof sqliteFreshScanStore.saveRun>[0], candidates: Parameters<typeof sqliteFreshScanStore.saveRun>[1]): Promise<void> {
+    if (postgresFreshScanStore?.provider === "postgres") {
+      try {
+        await postgresFreshScanStore.saveRun(run, candidates);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "不明なエラー";
+
+        console.warn(`Postgres Fresh Scan保存に失敗しました。SQLite fallbackを使います: ${message}`);
+      }
+    }
+
+    await sqliteFreshScanStore.saveRun(run, candidates);
+  },
+  async savePerformanceSnapshot(snapshot: Parameters<typeof sqliteFreshScanStore.savePerformanceSnapshot>[0]): Promise<void> {
+    if (postgresFreshScanStore?.provider === "postgres") {
+      try {
+        await postgresFreshScanStore.savePerformanceSnapshot(snapshot);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "不明なエラー";
+
+        console.warn(`Postgres Fresh Scan snapshot保存に失敗しました。SQLite fallbackを使います: ${message}`);
+      }
+    }
+
+    await sqliteFreshScanStore.savePerformanceSnapshot(snapshot);
+  },
+};
+const alertStore = {
+  provider: postgresAlertStore?.provider ?? sqliteAlertStore.provider,
+  async saveRun(run: Parameters<typeof sqliteAlertStore.saveRun>[0], candidates: Parameters<typeof sqliteAlertStore.saveRun>[1]): Promise<void> {
+    if (postgresAlertStore?.provider === "postgres") {
+      try {
+        await postgresAlertStore.saveRun(run, candidates);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "不明なエラー";
+
+        console.warn(`Postgres Alert保存に失敗しました。SQLite fallbackを使います: ${message}`);
+      }
+    }
+
+    await sqliteAlertStore.saveRun(run, candidates);
+  },
+  async savePerformanceSnapshot(snapshot: Parameters<typeof sqliteAlertStore.savePerformanceSnapshot>[0]): Promise<void> {
+    if (postgresAlertStore?.provider === "postgres") {
+      try {
+        await postgresAlertStore.savePerformanceSnapshot(snapshot);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "不明なエラー";
+
+        console.warn(`Postgres Alert snapshot保存に失敗しました。SQLite fallbackを使います: ${message}`);
+      }
+    }
+
+    await sqliteAlertStore.savePerformanceSnapshot(snapshot);
+  },
+};
+const insertAlertPumpNotification = db.prepare(`
+  INSERT OR IGNORE INTO alert_pump_notifications (
+    notification_id,
+    alert_run_id,
+    token_address,
+    threshold_x,
+    return_x,
+    entry_mcap,
+    peak_mcap,
+    time_to_peak_hours,
+    snapshot_label,
+    channel_id,
+    message_id,
+    notified_at
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+`);
+const updateAlertPumpNotificationMessage = db.prepare(`
+  UPDATE alert_pump_notifications
+  SET message_id = ?
+  WHERE token_address = ? AND threshold_x = ?
+`);
 const insertSignal = db.prepare(`
   INSERT INTO signals (
     signal_id,
@@ -849,6 +1325,12 @@ const insertSignal = db.prepare(`
     name,
     chain,
     narrative,
+    narrative_summary,
+    narrative_type,
+    narrative_sources,
+    narrative_evidence,
+    narrative_tags,
+    narrative_confidence,
     signal_type,
     edge_score,
     status,
@@ -877,6 +1359,12 @@ const insertSignal = db.prepare(`
     @name,
     'solana',
     @narrative,
+    @narrativeSummary,
+    @narrativeType,
+    @narrativeSources,
+    @narrativeEvidence,
+    @narrativeTags,
+    @narrativeConfidence,
     @signalType,
     @edgeScore,
     @status,
@@ -948,7 +1436,7 @@ const markScanResultPosted = db.prepare(`
   WHERE scan_id = ?
 `);
 const getSignalById = db.prepare(`
-  SELECT signal_id, token_address, symbol, scan_mcap, scan_price, message_id, channel_id
+  SELECT signal_id, scan_id, token_address, symbol, signal_type, scan_time, scan_mcap, scan_price, message_id, channel_id
   FROM signals
   WHERE signal_id = ?
 `);
@@ -964,8 +1452,45 @@ const getRecentAlertByToken = db.prepare(`
   WHERE token_address = ? AND triggered_at >= ?
   LIMIT 1
 `);
+const getLatestAlertByToken = db.prepare(`
+  SELECT alert_id, alert_run_id, token_address, mcap, flow_24h, traders, cli_grade, triggered_at
+  FROM alerts
+  WHERE token_address = ?
+  ORDER BY triggered_at DESC
+  LIMIT 1
+`);
+const getRecentFreshScanCandidatesForAlert = db.prepare(`
+  SELECT id, scan_id, token_address, symbol, name, candidate_rank, candidate_sources,
+    mcap, age_days, liquidity, flow_24h, flow_7d, flow_mcap, traders, cli_grade, created_at
+  FROM scan_candidates
+  WHERE created_at >= ?
+  ORDER BY COALESCE(fresh_scan_rank_score, momentum_score, score, 0) DESC
+  LIMIT ?
+`);
+const getRecentWatchCandidatesForAlert = db.prepare(`
+  SELECT
+    user_picks.pick_id,
+    user_picks.signal_id,
+    user_picks.action,
+    user_picks.clicked_at,
+    signals.token_address,
+    signals.symbol,
+    signals.name,
+    signals.scan_mcap,
+    signals.scan_price,
+    signals.flow_24h,
+    signals.flow_7d,
+    signals.flow_mcap_ratio,
+    signals.trader_count,
+    signals.token_age
+  FROM user_picks
+  INNER JOIN signals ON signals.signal_id = user_picks.signal_id
+  WHERE user_picks.clicked_at >= ? AND user_picks.action IN ('watch', 'paper_in', 'conviction')
+  ORDER BY user_picks.clicked_at DESC
+  LIMIT ?
+`);
 const getLatestSignalByToken = db.prepare(`
-  SELECT signal_id, token_address, symbol, scan_mcap, scan_price, message_id, channel_id
+  SELECT signal_id, token_address, symbol, name, signal_type, scan_mcap, scan_price, flow_24h, flow_7d, flow_mcap_ratio, trader_count, token_age, message_id, channel_id
   FROM signals
   WHERE token_address = ?
   ORDER BY scan_time DESC
@@ -987,6 +1512,26 @@ const insertAlert = db.prepare(`
     deep_check_id
   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
+const updateAlertV2Details = db.prepare(`
+  UPDATE alerts
+  SET alert_run_id = ?,
+      message_id = ?,
+      mcap = ?,
+      age_days = ?,
+      liquidity = ?,
+      flow_1h = ?,
+      flow_4h = ?,
+      flow_24h = ?,
+      flow_mcap = ?,
+      traders = ?,
+      score = ?,
+      cli_grade = ?,
+      candidate_source_type = ?,
+      is_realert = ?,
+      realert_reason = ?,
+      created_at = ?
+  WHERE alert_id = ?
+`);
 const insertDeepCheck = db.prepare(`
   INSERT INTO deep_checks (
     deep_check_id,
@@ -999,9 +1544,33 @@ const insertDeepCheck = db.prepare(`
     cluster_risk,
     final_note,
     raw_summary,
+    narrative_summary,
+    narrative_type,
+    narrative_sources,
+    narrative_evidence,
+    narrative_tags,
+    narrative_confidence,
     wallet_quality_summary,
     wallet_behavior_counts,
     estimated_independent_wallets,
+    created_at
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`);
+const insertTokenInfoSnapshot = db.prepare(`
+  INSERT INTO token_info_snapshots (
+    id,
+    token_address,
+    name,
+    symbol,
+    description,
+    logo_url,
+    website_url,
+    twitter_url,
+    telegram_url,
+    dexscreener_url,
+    gmgn_url,
+    x_search_url,
+    raw_json,
     created_at
   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
@@ -1071,8 +1640,14 @@ const insertUserPick = db.prepare(`
     used_points,
     clicked_at,
     entry_mcap,
-    entry_price
-  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    entry_price,
+    button_type,
+    time_since_signal_minutes,
+    mcap_at_click,
+    price_at_click,
+    signal_source,
+    signal_type
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 const updateUserPick = db.prepare(`
   UPDATE user_picks
@@ -1080,7 +1655,13 @@ const updateUserPick = db.prepare(`
       used_points = ?,
       clicked_at = ?,
       entry_mcap = ?,
-      entry_price = ?
+      entry_price = ?,
+      button_type = ?,
+      time_since_signal_minutes = ?,
+      mcap_at_click = ?,
+      price_at_click = ?,
+      signal_source = ?,
+      signal_type = ?
   WHERE pick_id = ?
 `);
 const getLatestScanId = db.prepare(`
@@ -1172,6 +1753,27 @@ const getUserPicksBetween = db.prepare(`
   FROM user_picks
   INNER JOIN signals ON signals.signal_id = user_picks.signal_id
   WHERE user_picks.user_id = ? AND user_picks.clicked_at >= ? AND user_picks.clicked_at < ?
+  ORDER BY user_picks.clicked_at DESC
+`);
+const getUserPicksWithSignals = db.prepare(`
+  SELECT
+    user_picks.pick_id,
+    user_picks.signal_id,
+    user_picks.user_id,
+    user_picks.action,
+    user_picks.used_points,
+    user_picks.clicked_at,
+    user_picks.entry_mcap,
+    user_picks.entry_price,
+    signals.token_address,
+    signals.symbol,
+    signals.scan_id,
+    signals.scan_time,
+    signals.scan_mcap,
+    signals.scan_price
+  FROM user_picks
+  INNER JOIN signals ON signals.signal_id = user_picks.signal_id
+  WHERE user_picks.user_id = ?
   ORDER BY user_picks.clicked_at DESC
 `);
 const getAllUserPicksBetween = db.prepare(`
@@ -1329,6 +1931,64 @@ function findNetflowRows(value: unknown): NetflowRow[] {
   return [];
 }
 
+function getNetflowTokenAddress(row: NetflowRow): string | null {
+  const tokenAddress = row.token_address;
+
+  if (typeof tokenAddress !== "string") return null;
+
+  const normalized = tokenAddress.trim();
+
+  return normalized.length > 0 ? normalized : null;
+}
+
+function dedupeNetflowRowsByTokenAddress(rows: NetflowRow[]): NetflowRow[] {
+  const seen = new Set<string>();
+  const deduped: NetflowRow[] = [];
+
+  for (const row of rows) {
+    const tokenAddress = getNetflowTokenAddress(row);
+
+    if (!tokenAddress) {
+      deduped.push(row);
+      continue;
+    }
+
+    const key = tokenAddress.toLowerCase();
+
+    if (seen.has(key)) continue;
+
+    seen.add(key);
+    deduped.push(row);
+  }
+
+  return deduped;
+}
+
+function formatMemeScanError(error: unknown): string {
+  const message = error instanceof Error ? error.message : "不明なエラー";
+
+  if (
+    message.includes("body -> pagination -> per_page") ||
+    message.includes("allowed range") ||
+    message.includes("--limit 1500")
+  ) {
+    return [
+      "Nansenの1回取得上限1000を超えたため、limitを1000にclampして再取得する必要があります。",
+      "このBotではFresh ScanのcandidatePoolSizeは1500のまま維持し、Nansenへの1回あたりlimitだけ1000に制限します。",
+      `詳細: ${message}`,
+    ].join("\n");
+  }
+
+  if (message.startsWith("Command failed: nansen")) {
+    return [
+      "Nansen CLIの実行に失敗しました。CLI認証、credits、または一時的なNansen側エラーを確認してください。",
+      `詳細: ${message}`,
+    ].join("\n");
+  }
+
+  return message;
+}
+
 function formatCompactUsd(value: unknown): string {
   if (value === null || value === undefined) {
     return "N/A";
@@ -1371,6 +2031,14 @@ function formatReturnX(value: number | null): string {
   }
 
   return `${value.toFixed(2)}x`;
+}
+
+function formatTreeRows(rows: Array<[string, string]>): string[] {
+  return rows.map(([label, value], index) => {
+    const branch = index === rows.length - 1 ? "└" : "├";
+
+    return `${branch} ${label}　${value}`;
+  });
 }
 
 function formatScore(value: number | null): string {
@@ -1665,7 +2333,7 @@ function formatDeskTestMessage(rows: NetflowRow[]): string {
       `7日: ${formatCompactUsd(row.net_flow_7d_usd)}`,
       `トレーダー: ${formatCount(row.trader_count)}人`,
       `時価総額: ${formatCompactUsd(row.market_cap_usd)}`,
-    ].join(" | ");
+    ].join("｜");
   });
 
   return ["Nansen Smart Money Netflow確認（Solana）", ...lines].join("\n");
@@ -1714,6 +2382,25 @@ function scoreSmartMoney(flow24h: number | null, flow7d: number | null): number 
 
 function scoreEarlyness(ageDays: number | null): number {
   return clampScore(findAgeScoringBucket(ageDays)?.score ?? Math.round(scoringConfig.scoreWeights.freshnessAge * 0.4), 0, scoringConfig.scoreWeights.freshnessAge);
+}
+
+function isThinLiquidity(params: {
+  marketCap: number | null;
+  flow24h: number | null;
+  flowMcapRatio: number | null;
+  traderCount: number | null;
+}): boolean {
+  const { marketCap, flow24h, flowMcapRatio, traderCount } = params;
+
+  if ((traderCount ?? Infinity) <= 2 && (flowMcapRatio ?? 0) >= 0.01) {
+    return true;
+  }
+
+  if ((flow24h ?? Infinity) < 2_000 && (flowMcapRatio ?? 0) >= 0.03) {
+    return true;
+  }
+
+  return marketCap !== null && marketCap < 50_000 && (flow24h ?? 0) > 0 && (flowMcapRatio ?? 0) >= 0.01;
 }
 
 function scoreMcapSweetSpot(marketCap: number | null): number {
@@ -1873,6 +2560,358 @@ function buildNarrative(row: NetflowRow, symbol: string, name: string): string {
   return `${displayName} は${sectorText}周辺で拾われた、名前先行のミーム候補です。symbolとnameからは強いジャンル断定はしにくい一方、短い名前や抽象ワードはコミュニティが後から意味付けしやすい余白があります。買い手はSmart Money flowを初動サインとして見て、テーマ化される前の早い段階に期待している可能性があります。`;
 }
 
+type ResolveTokenNarrativeContext = {
+  row: NetflowRow | null;
+  tokenAddress: string;
+  symbol: string;
+  name: string;
+  signalType: SignalType;
+  marketCap: number | null;
+  flow24h: number | null;
+  flow7d: number | null;
+  flowMcapRatio: number | null;
+  traderCount: number | null;
+  ageDays: number | null;
+  tokenInfo: TokenInformationSnapshot | null;
+  dexProfile: Awaited<ReturnType<typeof fetchDexScreenerTokenProfile>> | null;
+  tokenIconUrl: string | null;
+};
+
+function compactText(value: string | null, maxLength = 220): string | null {
+  if (!value) {
+    return null;
+  }
+
+  const compacted = value.replace(/\s+/g, " ").trim();
+
+  if (compacted.length <= maxLength) {
+    return compacted;
+  }
+
+  return `${compacted.slice(0, maxLength - 1)}…`;
+}
+
+function inferNarrativeType(text: string, hasPumpFun: boolean, hasFlow: boolean): NarrativeType {
+  const normalized = text.toLowerCase();
+
+  if (hasPumpFun) return "pump_fun";
+  if (/dog|cat|shiba|frog|pepe|inu|wif|bonk|犬|猫|カエル/.test(normalized)) return "animal";
+  if (/trump|biden|maga|politic|president|election|senate|america|usa|政治|選挙/.test(normalized)) return "political";
+  if (/musk|elon|tate|vitalik|celebrity|founder|ceo|人物/.test(normalized)) return "celebrity";
+  if (/\bai\b|gpt|robot|agent|人工知能/.test(normalized)) return "ai";
+  if (/game|gaming|play|quest|arcade|ゲーム/.test(normalized)) return "gaming";
+  if (/sport|football|soccer|nba|nfl|mlb|athlete|スポーツ/.test(normalized)) return "sports";
+  if (/anime|manga|waifu|アニメ|漫画/.test(normalized)) return "anime";
+  if (/brand|nike|tesla|spacex|apple|google|mascot|logo|ブランド/.test(normalized)) return "brand";
+  if (/asteroid|meteor|space|moon|mars|rocket|spacex|cosmo|宇宙|月|惑星/.test(normalized)) return "space";
+  if (/scuba|fish|whale|ocean|shark|water|aqua|sea|水中|海/.test(normalized)) return "aquatic";
+  if (/belief|faith|god|jesus|church|pray|abstract|信念|信仰|神/.test(normalized)) return "abstract";
+  if (hasFlow) return "flow_driven";
+
+  return "unknown";
+}
+
+function getNarrativeTypeLabel(type: NarrativeType): string {
+  const labels: Record<NarrativeType, string> = {
+    animal: "動物・キャラクター系",
+    celebrity: "人物・インフルエンサー系",
+    ai: "AI・agent系",
+    gaming: "ゲーム系",
+    political: "政治・イベント系",
+    sports: "スポーツ系",
+    anime: "アニメ・キャラ系",
+    brand: "ブランド・マスコット系",
+    space: "宇宙・SF系",
+    aquatic: "水中・海洋系",
+    pump_fun: "pump.fun初動系",
+    abstract: "抽象ワード系",
+    flow_driven: "flow主導",
+    unknown: "テーマ薄め",
+  };
+
+  return labels[type];
+}
+
+function formatSignalTypeLabel(signalType: SignalType): string {
+  const labels: Record<SignalType, string> = {
+    alert_edge: "🚨 強シグナル",
+    flow_watch: "📈 資金流入あり",
+    whale_flow: "🐋 大口流入",
+    thin_liquidity: "📈 資金流入あり",
+    bot_like_flow: "📈 資金流入あり",
+  };
+
+  return labels[signalType];
+}
+
+function normalizeRiskToken(value: string): string {
+  return value.trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+}
+
+function collectDisplayRiskLabels(values: Array<string | null | undefined>): string[] {
+  const riskLabels = new Set<string>();
+
+  for (const rawValue of values) {
+    if (!rawValue) continue;
+
+    const value = normalizeRiskToken(rawValue);
+
+    if (
+      value.includes("liquidity_missing") ||
+      value.includes("thin_liquidity") ||
+      value.includes("liquidity_below_threshold")
+    ) {
+      riskLabels.add("⚠️ 流動性薄め");
+    }
+
+    if (
+      value.includes("bot_like_flow") ||
+      value.includes("micro_arb_heavy") ||
+      value.includes("mirror_like_heavy") ||
+      value.includes("cluster_risk_high") ||
+      value.includes("cluster_risk_medium")
+    ) {
+      riskLabels.add("🤖 不自然flow疑い");
+    }
+
+    if (
+      value.includes("holder_risk_high") ||
+      value.includes("holder_concentration") ||
+      value.includes("concentrated_holders")
+    ) {
+      riskLabels.add("👥 Holder集中");
+    }
+
+    if (
+      value.includes("sell_pressure_high") ||
+      value.includes("buyer_seller_bearish") ||
+      value === "sell_pressure" ||
+      value.includes("sell_pressure_")
+    ) {
+      riskLabels.add("🔻 売り圧強め");
+    }
+  }
+
+  return Array.from(riskLabels);
+}
+
+function getResearchCardRiskLabels(card: MemeResearchCard): string[] {
+  return collectDisplayRiskLabels([card.signalType]);
+}
+
+function getSignalRiskLabels(signalType: SignalType): string[] {
+  return collectDisplayRiskLabels([signalType]);
+}
+
+function getAlertCardRiskLabels(
+  card: MemeResearchCard,
+  deepCheck?: DeepCheckReply,
+  gate?: AlertQualityGateResult,
+  candidate?: AlertV2Candidate,
+): string[] {
+  return collectDisplayRiskLabels([
+    card.signalType,
+    ...(candidate?.riskFlags ?? []),
+    ...(candidate?.warningFlags ?? []),
+    ...(candidate?.qualityGateWarnings ?? []),
+    ...(gate?.warnings ?? []),
+    candidate?.holderRisk === "High" ? "holder_risk_high" : null,
+    candidate?.sellPressure === "High" ? "sell_pressure_high" : null,
+    candidate?.clusterRisk === "High" ? "cluster_risk_high" : null,
+    candidate?.clusterRisk === "Medium" ? "cluster_risk_medium" : null,
+    candidate?.walletQuality === "Low" ? "bot_like_flow" : null,
+    deepCheck?.holderQuality.label === "High" ? "holder_risk_high" : null,
+    deepCheck?.sellPressure.label === "High" ? "sell_pressure_high" : null,
+    deepCheck?.buyerSellerBalance.label === "Bearish" ? "buyer_seller_bearish" : null,
+    deepCheck?.clusterRisk.label === "High" ? "cluster_risk_high" : null,
+    deepCheck?.clusterRisk.label === "Medium" ? "cluster_risk_medium" : null,
+    deepCheck && (
+      deepCheck.walletQuality.behaviorCounts["Micro-arb"] > 0 ||
+      deepCheck.walletQuality.behaviorCounts["Mirror-like"] > 0
+    ) ? "micro_arb_heavy" : null,
+  ]);
+}
+
+function formatDisplayRiskLine(labels: string[]): string {
+  return labels.length > 0 ? labels.join("｜") : "なし";
+}
+
+function getSignalNarrativeSentence(context: ResolveTokenNarrativeContext): string {
+  const flowText = `MCap ${formatCompactUsd(context.marketCap)}、24h Flow ${formatCompactUsd(context.flow24h)}、Flow/MCap ${formatPercent(context.flowMcapRatio)}`;
+
+  switch (context.signalType) {
+    case "alert_edge":
+      return `${flowText}に加え、Alert条件を満たす強さがあるため、テーマだけでなく資金流入の質も見る候補です。`;
+    case "thin_liquidity":
+      return `流動性が薄い候補なので、テーマ性よりも少額flowが大きく見えやすい点を織り込んで見ます。`;
+    case "bot_like_flow":
+      return `wallet行動が主材料で、mirror / micro-arb寄りの短期flowかどうかを優先して確認する候補です。`;
+    case "whale_flow":
+      return `コミュニティ発の広がりより、大口flow主導で動いているかを中心に見る候補です。`;
+    case "flow_watch":
+    default:
+      return `${flowText}を起点に、Smart Money flowの継続を監視するFlow Watchです。`;
+  }
+}
+
+function getThemeSentence(
+  context: ResolveTokenNarrativeContext,
+  narrativeType: NarrativeType,
+  description: string | null,
+  hasImage: boolean,
+): string {
+  const displayName = `${context.symbol} / ${context.name}`;
+  const theme = getNarrativeTypeLabel(narrativeType);
+
+  if (description) {
+    return `${displayName}は、profile / token information上の「${compactText(description, 120)}」を文脈に持つ${theme}ミーム候補です。`;
+  }
+
+  if (narrativeType === "flow_driven" || narrativeType === "unknown") {
+    return `${displayName}は、明確なキャラクター性よりも小型MCapとSmart Money flowを軸に監視するタイプです。`;
+  }
+
+  if (hasImage) {
+    return `${displayName}は、tickerとtoken imageの方向性を合わせて見たい${theme}ミーム候補です。`;
+  }
+
+  return `${displayName}は、tickerの覚えやすさとSmart Money flowを先に見る${theme}寄りの候補です。`;
+}
+
+function getNarrativeEvidence(context: ResolveTokenNarrativeContext, socialLinks: NarrativeSocialLinks, description: string | null): string[] {
+  const evidence: string[] = [];
+
+  if (description) evidence.push("profile / token information由来の説明文あり");
+  if (context.tokenInfo?.deploymentDate) evidence.push(`deployment: ${context.tokenInfo.deploymentDate}`);
+  if (context.tokenInfo?.logoUrl || context.dexProfile?.imageUrl || context.tokenIconUrl) evidence.push("token image / logoを取得");
+  if (socialLinks.twitter) evidence.push("X / Twitter linkあり");
+  if (socialLinks.website) evidence.push("website linkあり");
+  if (context.marketCap !== null) evidence.push(`MCap ${formatCompactUsd(context.marketCap)}`);
+  if ((context.flow24h ?? 0) > 0) evidence.push(`24h Smart Money flow ${formatCompactUsd(context.flow24h)}`);
+  if (context.traderCount !== null) evidence.push(`Traders ${formatCount(context.traderCount)}人`);
+
+  return evidence.slice(0, 6);
+}
+
+function buildNarrativePoints(context: ResolveTokenNarrativeContext, narrativeType: NarrativeType, evidence: string[]): string[] {
+  const points: string[] = [];
+
+  if (evidence.some((item) => /説明文|X|website|image/.test(item))) {
+    points.push(evidence.find((item) => /説明文|X|website|image/.test(item)) ?? "");
+  }
+
+  if (context.marketCap !== null && context.flowMcapRatio !== null) {
+    points.push(`MCap ${formatCompactUsd(context.marketCap)}に対してFlow/MCap ${formatPercent(context.flowMcapRatio)}が反応`);
+  } else if ((context.flow24h ?? 0) > 0) {
+    points.push(`24h Smart Money flow ${formatCompactUsd(context.flow24h)}を検出`);
+  }
+
+  if (context.signalType === "flow_watch") {
+    points.push("SignalはFlow Watchで、テーマよりflow継続を優先して監視");
+  } else if (context.signalType === "thin_liquidity") {
+    points.push("薄商いのため、少額flowでも大きく見えやすい");
+  } else if (context.signalType === "bot_like_flow") {
+    points.push("wallet behavior主導のflowとしてCluster Riskを確認");
+  } else {
+    points.push(`${formatSignalTypeLabel(context.signalType)}として、Signal Typeと${getNarrativeTypeLabel(narrativeType)}の噛み合いを確認`);
+  }
+
+  return points.filter(Boolean).slice(0, 3);
+}
+
+// Narrative Resolver is retained for future use, currently hidden from UI.
+function resolveTokenNarrative(context: ResolveTokenNarrativeContext): TokenNarrative {
+  const rowMetadata = getNestedRecord(context.row?.metadata) ?? getNestedRecord(context.row?.token_metadata);
+  const metadataProfile: TokenProfileContext = {
+    source: "token metadata",
+    description: getFirstTextFromRecords(rowMetadata, [/description|about|profile|bio|summary/]),
+    imageUrl: extractTokenIconUrlFromRow(context.row ?? {}),
+    links: extractSocialLinks(rowMetadata),
+  };
+  const dexProfile: TokenProfileContext = {
+    source: "DexScreener",
+    description: context.dexProfile?.description ?? null,
+    imageUrl: context.dexProfile?.imageUrl ?? null,
+    links: context.dexProfile?.links ?? {},
+  };
+  const tokenInfoLinks: NarrativeSocialLinks = {
+    website: context.tokenInfo?.websiteUrl ?? undefined,
+    twitter: context.tokenInfo?.twitterUrl ?? undefined,
+    telegram: context.tokenInfo?.telegramUrl ?? undefined,
+  };
+  const baseLinks: NarrativeSocialLinks = {
+    dexscreener: `https://dexscreener.com/solana/${context.tokenAddress}`,
+    gmgn: `https://gmgn.ai/sol/token/${context.tokenAddress}`,
+    universalx: `https://universalx.app/trade?assetId=101_${context.tokenAddress}`,
+    xSearch: getXSearchUrl(context.symbol, context.tokenAddress),
+  };
+  const socialLinks = mergeSocialLinks(tokenInfoLinks, dexProfile.links, metadataProfile.links, baseLinks);
+  const description =
+    context.tokenInfo?.description ??
+    dexProfile.description ??
+    metadataProfile.description ??
+    null;
+  const sourceCandidates = [
+    context.tokenInfo ? "Nansen token info" : null,
+    dexProfile.description || dexProfile.imageUrl || Object.keys(dexProfile.links).length > 0 ? "DexScreener profile" : null,
+    metadataProfile.description || metadataProfile.imageUrl || Object.keys(metadataProfile.links).length > 0 ? "token metadata" : null,
+    socialLinks.twitter ? "X / Twitter link" : "X search",
+    "Signal Type / MCap / Flow",
+  ].filter((value): value is string => Boolean(value));
+  const rawText = [
+    context.symbol,
+    context.name,
+    description,
+    context.tokenInfo?.logoUrl,
+    dexProfile.imageUrl,
+    metadataProfile.imageUrl,
+    socialLinks.website,
+    socialLinks.twitter,
+    ...((Array.isArray(context.row?.token_sectors) ? context.row?.token_sectors : []) as unknown[]).filter((item): item is string => typeof item === "string"),
+  ].filter(Boolean).join(" ");
+  const hasPumpFun = /pump\.fun|pumpfun|\bpump\b/i.test(rawText);
+  const hasFlow = (context.flow24h ?? 0) > 0 || (context.flowMcapRatio ?? 0) > 0;
+  const narrativeType = inferNarrativeType(rawText, hasPumpFun, hasFlow);
+  const hasConcreteContext = Boolean(description || socialLinks.twitter || socialLinks.website);
+  const hasImage = Boolean(context.tokenInfo?.logoUrl || dexProfile.imageUrl || metadataProfile.imageUrl || context.tokenIconUrl);
+  const themeSentence = getThemeSentence(context, narrativeType, description, hasImage);
+  const signalSentence = getSignalNarrativeSentence(context);
+  const perspectiveSentence = hasConcreteContext
+    ? `単なるname / symbolの連想ではなく、social / profile / imageとflowが同じ方向を向いているかを見ます。`
+    : narrativeType === "flow_driven" || narrativeType === "unknown"
+      ? `テーマ主導というより、tickerの覚えやすさと短期flowが先行している形として整理します。`
+      : `具体的な発祥より、ticker・画像テーマ・低MCap flowの組み合わせで整理します。`;
+  const evidence = getNarrativeEvidence(context, socialLinks, description);
+  const points = buildNarrativePoints(context, narrativeType, evidence);
+  const narrativeSummary = [
+    "Theme context:",
+    themeSentence,
+    signalSentence,
+    perspectiveSentence,
+    "",
+    "見るポイント:",
+    ...points.map((point) => `• ${point}`),
+  ].join("\n");
+  const narrativeTags = [
+    narrativeType,
+    context.signalType,
+    hasPumpFun ? "pump_fun" : null,
+    hasImage ? "image" : null,
+    hasConcreteContext ? "profile_context" : "flow_context",
+  ].filter((value): value is string => Boolean(value));
+  const internalConfidence: NarrativeConfidence = hasConcreteContext && context.tokenInfo ? "High" : hasConcreteContext || hasImage ? "Medium" : "Low";
+
+  return {
+    narrativeSummary,
+    narrativeType,
+    narrativeSources: sourceCandidates,
+    narrativeEvidence: evidence,
+    narrativeTags,
+    socialLinks,
+    internalConfidence,
+  };
+}
+
 function buildWhyFlagged(
   marketCap: number | null,
   flow24h: number | null,
@@ -1884,7 +2923,7 @@ function buildWhyFlagged(
   const reasons: string[] = [];
 
   if (ageDays !== null && ageDays >= 180 && ((flow24h ?? 0) >= 5_000 || (flowMcapRatio ?? 0) >= 0.03)) {
-    reasons.push("🔁 Re-Flow: 古い銘柄に再びSmart Money flowが入った候補です");
+    reasons.push("🔁 再流入: 古い銘柄に再びSmart Money flowが入った候補です");
   }
 
   if (flowMcapRatio !== null && flowMcapRatio > 0.002) {
@@ -1914,6 +2953,66 @@ function buildWhyFlagged(
   return reasons.length > 0
     ? reasons.map((reason) => `- ${reason}`).join("\n")
     : "- Smart Money netflow Fresh Scanで検出";
+}
+
+function buildDetectionReasons(params: {
+  marketCap: number | null;
+  flow24h: number | null;
+  flowMcapRatio: number | null;
+  traderCount: number | null;
+  ageDays: number | null;
+  cliGrade?: CliGrade;
+}): string {
+  const reasons: string[] = [];
+
+  if (params.marketCap !== null && params.flowMcapRatio !== null) {
+    reasons.push([
+      "• 小型MCapに対して資金流入あり",
+      `  MCap ${formatCompactUsd(params.marketCap)} / Flow-MCap ${formatPercent(params.flowMcapRatio)}。少額flowでも価格に反映されやすい帯か確認します。`,
+    ].join("\n"));
+  }
+
+  if ((params.flow24h ?? 0) > 0) {
+    const alertText = (params.flow24h ?? 0) >= scoringConfig.alertRules.min24hFlowUsd
+      ? "Alert級のflow水準に近く、継続流入を見たい段階です。"
+      : "Alert条件には未満ですが、Flow Watchとして監視価値があります。";
+
+    reasons.push([
+      "• 直近Smart Money flowを検出",
+      `  24h Flow ${formatCompactUsd(params.flow24h)}。${alertText}`,
+    ].join("\n"));
+  }
+
+  if (params.traderCount !== null) {
+    reasons.push([
+      "• 参加者数",
+      `  Traders ${formatCount(params.traderCount)}人。単独ではないものの、追加参加者の増加を確認したい段階です。`,
+    ].join("\n"));
+  }
+
+  if (params.ageDays !== null) {
+    const ageMeaning = params.ageDays <= 1
+      ? "Solanaミームでは超初動として見る時間帯です。"
+      : params.ageDays <= 5
+        ? "Solanaミームでは初動後の継続flowを見る時間帯です。"
+        : "Freshではなく既存銘柄への再流入として見ます。";
+
+    reasons.push([
+      "• Age",
+      `  ${params.ageDays.toFixed(1)}日。${ageMeaning}`,
+    ].join("\n"));
+  }
+
+  if (params.cliGrade && params.cliGrade !== "Unchecked") {
+    reasons.push([
+      "• CLI Quality Gate",
+      `  Grade ${params.cliGrade}。Nansen CLI検証をスコア加点ではなくQuality Gateとして反映しています。`,
+    ].join("\n"));
+  }
+
+  return reasons.length > 0
+    ? reasons.slice(0, 5).join("\n")
+    : "• Smart Money flow\n  Fresh Scan v2の市場レーダーで検出しました。";
 }
 
 function buildRisk(
@@ -2037,10 +3136,289 @@ async function fetchDexScreenerMarketData(
     return {
       marketCap: toFiniteNumber(bestPair.marketCap) ?? toFiniteNumber(bestPair.fdv),
       price: toFiniteNumber(bestPair.priceUsd),
+      liquidity: toFiniteNumber(bestPair.liquidity?.usd),
+      volume24h: toFiniteNumber(bestPair.volume?.h24),
+      pairUrl: toOptionalText(bestPair.url) ?? `https://dexscreener.com/solana/${tokenAddress}`,
+      raw: bestPair,
     };
   } catch {
     return null;
   }
+}
+
+async function enrichMarketDataForToken(
+  tokenAddress: string,
+  existingCandidate: {
+    marketCap?: number | null;
+    price?: number | null;
+    entryPrice?: number | null;
+    liquidity?: number | null;
+    volume24h?: number | null;
+    warningFlags?: string[];
+    rawDexscreenerSnapshot?: unknown;
+  },
+): Promise<MarketDataEnrichment> {
+  const refreshedAt = new Date().toISOString();
+  const warningFlags = new Set(existingCandidate.warningFlags ?? []);
+  let market: DexScreenerMarketData | null = null;
+  let warning: string | null = null;
+
+  try {
+    market = await fetchDexScreenerMarketData(tokenAddress);
+  } catch (error) {
+    warning = error instanceof Error ? error.message : "market data補完に失敗";
+  }
+
+  if (!market) {
+    warningFlags.add("market_data_missing");
+    if (existingCandidate.price === null || existingCandidate.price === undefined) warningFlags.add("price_missing");
+    if (existingCandidate.liquidity === null || existingCandidate.liquidity === undefined) warningFlags.add("liquidity_missing");
+  }
+
+  const price = market?.price ?? existingCandidate.price ?? null;
+  const liquidity = market?.liquidity ?? existingCandidate.liquidity ?? null;
+  const volume24h = market?.volume24h ?? existingCandidate.volume24h ?? null;
+
+  if (price === null) warningFlags.add("price_missing");
+  if (liquidity === null) warningFlags.add("liquidity_missing");
+
+  return {
+    marketCap: existingCandidate.marketCap ?? market?.marketCap ?? null,
+    price,
+    entryPrice: existingCandidate.entryPrice ?? price,
+    liquidity,
+    volume24h,
+    pairUrl: market?.pairUrl ?? null,
+    refreshedAt,
+    ageMinutes: 0,
+    source: market ? "dexscreener" : null,
+    warning,
+    warningFlags: Array.from(warningFlags),
+    rawSnapshot: market?.raw ?? existingCandidate.rawDexscreenerSnapshot ?? null,
+  };
+}
+
+function getXSearchUrl(symbol: string | null, tokenAddress: string): string {
+  const query = [symbol, tokenAddress].filter(Boolean).join(" ");
+
+  return `https://x.com/search?q=${encodeURIComponent(query)}&src=typed_query`;
+}
+
+function isValidHttpUrl(value: string | null): value is string {
+  if (!value) {
+    return false;
+  }
+
+  try {
+    const url = new URL(value);
+
+    return url.protocol === "https:" || url.protocol === "http:";
+  } catch {
+    return false;
+  }
+}
+
+function getFirstTextFromRecords(value: unknown, patterns: RegExp[]): string | null {
+  for (const record of collectRecords(value)) {
+    const text = findTextByKey(record, patterns);
+
+    if (text) {
+      return text;
+    }
+  }
+
+  return null;
+}
+
+function getFirstNumberFromRecords(value: unknown, patterns: RegExp[]): number | null {
+  for (const record of collectRecords(value)) {
+    const numberValue = findNumberByKey(record, patterns);
+
+    if (numberValue !== null) {
+      return numberValue;
+    }
+  }
+
+  return null;
+}
+
+function getBestImageUrlFromValue(value: unknown): string | null {
+  for (const record of collectRecords(value)) {
+    for (const key of ["image", "image_url", "imageUrl", "icon", "icon_url", "logoURI", "logo_url", "logo", "header"]) {
+      const url = toOptionalText(record[key]);
+
+      if (isValidHttpImageUrl(url)) {
+        return url;
+      }
+    }
+  }
+
+  return null;
+}
+
+function mergeSocialLinks(...links: NarrativeSocialLinks[]): NarrativeSocialLinks {
+  return links.reduce<NarrativeSocialLinks>((merged, current) => ({
+    website: merged.website ?? current.website,
+    twitter: merged.twitter ?? current.twitter,
+    telegram: merged.telegram ?? current.telegram,
+    dexscreener: merged.dexscreener ?? current.dexscreener,
+    gmgn: merged.gmgn ?? current.gmgn,
+    universalx: merged.universalx ?? current.universalx,
+    xSearch: merged.xSearch ?? current.xSearch,
+  }), {});
+}
+
+function extractSocialLinks(value: unknown): NarrativeSocialLinks {
+  const links: NarrativeSocialLinks = {};
+
+  for (const record of collectRecords(value)) {
+    const label = [
+      toOptionalText(record.type),
+      toOptionalText(record.label),
+      toOptionalText(record.name),
+      toOptionalText(record.platform),
+    ].filter(Boolean).join(" ").toLowerCase();
+    const url = toOptionalText(record.url ?? record.href ?? record.link ?? record.website ?? record.twitter ?? record.telegram);
+
+    if (!isValidHttpUrl(url)) {
+      continue;
+    }
+
+    if (/twitter|x\.com|\bx\b/.test(label) || /(?:twitter\.com|x\.com)\//i.test(url)) {
+      links.twitter ??= url;
+    } else if (/telegram|tg\b/.test(label) || /(?:t\.me|telegram\.me)\//i.test(url)) {
+      links.telegram ??= url;
+    } else if (/web|site|homepage|official/.test(label)) {
+      links.website ??= url;
+    } else if (!links.website && !/dexscreener|gmgn|universalx/i.test(url)) {
+      links.website = url;
+    }
+  }
+
+  const directWebsite = getFirstTextFromRecords(value, [/website|site|homepage/]);
+  const directTwitter = getFirstTextFromRecords(value, [/twitter|x_url|xurl|x_link|xlink/]);
+  const directTelegram = getFirstTextFromRecords(value, [/telegram|tg_url|tgurl|tg_link|tglink/]);
+
+  if (isValidHttpUrl(directWebsite)) links.website ??= directWebsite;
+  if (isValidHttpUrl(directTwitter)) links.twitter ??= directTwitter;
+  if (isValidHttpUrl(directTelegram)) links.telegram ??= directTelegram;
+
+  return links;
+}
+
+function normalizeTokenInformation(
+  tokenAddress: string,
+  raw: unknown,
+): TokenInformationSnapshot {
+  return {
+    tokenAddress,
+    name: getFirstTextFromRecords(raw, [/^name$|token.*name/]),
+    symbol: getFirstTextFromRecords(raw, [/^symbol$|ticker|token.*symbol/]),
+    description: getFirstTextFromRecords(raw, [/description|about|profile|bio|summary/]),
+    logoUrl: getBestImageUrlFromValue(raw),
+    deploymentDate: getFirstTextFromRecords(raw, [/deploy|created|launch|pair.*created/]),
+    websiteUrl: extractSocialLinks(raw).website ?? null,
+    twitterUrl: extractSocialLinks(raw).twitter ?? null,
+    telegramUrl: extractSocialLinks(raw).telegram ?? null,
+    marketCap: getFirstNumberFromRecords(raw, [/market.*cap|mcap/]),
+    fdv: getFirstNumberFromRecords(raw, [/^fdv$|fully.*diluted/]),
+    volume: getFirstNumberFromRecords(raw, [/volume/]),
+    buys: getFirstNumberFromRecords(raw, [/buys|buy.*count/]),
+    sells: getFirstNumberFromRecords(raw, [/sells|sell.*count/]),
+    uniqueTraders: getFirstNumberFromRecords(raw, [/unique.*trader|trader.*count|traders/]),
+    liquidity: getFirstNumberFromRecords(raw, [/liquidity/]),
+    holders: getFirstNumberFromRecords(raw, [/holders|holder.*count/]),
+    raw,
+  };
+}
+
+async function fetchNansenTokenInformation(tokenAddress: string): Promise<TokenInformationSnapshot | null> {
+  if (tokenAddress === "UNKNOWN") {
+    return null;
+  }
+
+  const mode: NansenFetchMode = isMockNansenEnabled() ? "mock" : "live";
+  const cacheKey = `${mode}:${tokenAddress}`;
+  const cached = cachedTokenInformation.get(cacheKey);
+
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.value;
+  }
+
+  if (mode === "mock") {
+    cachedTokenInformation.set(cacheKey, {
+      value: null,
+      mode,
+      expiresAt: Date.now() + NANSEN_CACHE_TTL_MS,
+    });
+    return null;
+  }
+
+  try {
+    const raw = await runNansenJsonCommand([
+      "research",
+      "tgm",
+      "token-information",
+      "--token",
+      tokenAddress,
+      "--chain",
+      "solana",
+      "--output",
+      "json",
+    ]);
+    const normalized = normalizeTokenInformation(tokenAddress, raw);
+
+    cachedTokenInformation.set(cacheKey, {
+      value: normalized,
+      mode,
+      expiresAt: Date.now() + NANSEN_CACHE_TTL_MS,
+    });
+
+    return normalized;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "不明なエラー";
+
+    console.warn(`[Nansen token-information] ${tokenAddress} の取得に失敗しました: ${message}`);
+    cachedTokenInformation.set(cacheKey, {
+      value: null,
+      mode,
+      expiresAt: Date.now() + NANSEN_CACHE_TTL_MS,
+    });
+    return null;
+  }
+}
+
+function saveTokenInfoSnapshot(
+  tokenAddress: string,
+  tokenInfo: TokenInformationSnapshot | null,
+  socialLinks: NarrativeSocialLinks,
+  rawProfile: unknown,
+): void {
+  if (!tokenInfo && !rawProfile) {
+    return;
+  }
+
+  const rawJson = JSON.stringify({
+    nansen: tokenInfo?.raw ?? null,
+    profile: rawProfile ?? null,
+  });
+
+  insertTokenInfoSnapshot.run(
+    randomUUID(),
+    tokenAddress,
+    tokenInfo?.name ?? null,
+    tokenInfo?.symbol ?? null,
+    tokenInfo?.description ?? null,
+    tokenInfo?.logoUrl ?? null,
+    socialLinks.website ?? null,
+    socialLinks.twitter ?? null,
+    socialLinks.telegram ?? null,
+    socialLinks.dexscreener ?? null,
+    socialLinks.gmgn ?? null,
+    socialLinks.xSearch ?? null,
+    rawJson,
+    new Date().toISOString(),
+  );
 }
 
 async function getEntryMarketData(signal: SignalRecord): Promise<DexScreenerMarketData> {
@@ -2049,6 +3427,10 @@ async function getEntryMarketData(signal: SignalRecord): Promise<DexScreenerMark
   return {
     marketCap: liveData?.marketCap ?? signal.scan_mcap,
     price: liveData?.price ?? signal.scan_price,
+    liquidity: liveData?.liquidity ?? null,
+    volume24h: liveData?.volume24h ?? null,
+    pairUrl: liveData?.pairUrl ?? null,
+    raw: liveData?.raw ?? null,
   };
 }
 
@@ -2056,9 +3438,13 @@ async function fetchDexScreenerTokenProfile(tokenAddress: string): Promise<{
   symbol: string | null;
   name: string | null;
   marketCap: number | null;
+  description: string | null;
+  imageUrl: string | null;
+  links: NarrativeSocialLinks;
+  raw: unknown;
 }> {
   if (tokenAddress === "UNKNOWN") {
-    return { symbol: null, name: null, marketCap: null };
+    return { symbol: null, name: null, marketCap: null, description: null, imageUrl: null, links: {}, raw: null };
   }
 
   try {
@@ -2067,7 +3453,7 @@ async function fetchDexScreenerTokenProfile(tokenAddress: string): Promise<{
     );
 
     if (!response.ok) {
-      return { symbol: null, name: null, marketCap: null };
+      return { symbol: null, name: null, marketCap: null, description: null, imageUrl: null, links: {}, raw: null };
     }
 
     const data = (await response.json()) as DexScreenerTokenResponse;
@@ -2079,9 +3465,16 @@ async function fetchDexScreenerTokenProfile(tokenAddress: string): Promise<{
       symbol: toOptionalText(bestPair?.baseToken?.symbol),
       name: toOptionalText(bestPair?.baseToken?.name),
       marketCap: toFiniteNumber(bestPair?.marketCap) ?? toFiniteNumber(bestPair?.fdv),
+      description: getFirstTextFromRecords(bestPair?.info, [/description|about|profile|bio|summary/]),
+      imageUrl: getBestImageUrlFromValue(bestPair?.info),
+      links: {
+        ...extractSocialLinks(bestPair?.info),
+        dexscreener: toOptionalText(bestPair?.url) ?? `https://dexscreener.com/solana/${tokenAddress}`,
+      },
+      raw: data,
     };
   } catch {
-    return { symbol: null, name: null, marketCap: null };
+    return { symbol: null, name: null, marketCap: null, description: null, imageUrl: null, links: {}, raw: null };
   }
 }
 
@@ -2143,8 +3536,7 @@ function classifySignalType(params: {
   flow7d: number | null;
   flowMcapRatio: number | null;
   traderCount: number | null;
-  ageDays: number | null;
-  edgeScore: number;
+  liquidity?: number | null;
   forceAlert?: boolean;
 }): SignalType {
   const {
@@ -2153,44 +3545,32 @@ function classifySignalType(params: {
     flow7d,
     flowMcapRatio,
     traderCount,
-    ageDays,
-    edgeScore,
+    liquidity = null,
     forceAlert = false,
   } = params;
-  const strongFlow = (flow24h ?? 0) >= 5_000 || (flowMcapRatio ?? 0) >= 0.03;
+  const positiveFlow24h = (flow24h ?? 0) > 0;
+  const thinLiquidity = liquidity !== null && liquidity < scoringConfig.freshScanRules.minLiquidityUsd
+    ? true
+    : isThinLiquidity({ marketCap, flow24h, flowMcapRatio, traderCount });
+  const likelyBotLikeFlow = (traderCount ?? Infinity) <= 2 && positiveFlow24h && (flow7d ?? 0) <= 0;
+
+  if (likelyBotLikeFlow) {
+    return "bot_like_flow";
+  }
+
+  if (thinLiquidity) {
+    return "thin_liquidity";
+  }
 
   if (forceAlert) {
-    return "🚨 Alert Edge";
+    return "alert_edge";
   }
 
-  if (ageDays !== null && ageDays >= 180 && strongFlow) {
-    return "🔁 Re-Flow";
+  if (marketCap !== null && marketCap >= scoringConfig.freshScanRules.largeMcapThreshold && (flow24h ?? 0) >= 50_000) {
+    return "whale_flow";
   }
 
-  if ((traderCount ?? 0) <= 2 && (flowMcapRatio ?? 0) >= 0.03) {
-    return "⚠️ Thin Liquidity";
-  }
-
-  if ((traderCount ?? 0) <= 2 && (flow24h ?? 0) > 0 && (flow7d ?? 0) <= 0) {
-    return "🤖 Bot-like Flow";
-  }
-
-  if (marketCap !== null && marketCap >= 10_000_000 && (flow24h ?? 0) >= 50_000) {
-    return "🐋 Whale Flow";
-  }
-
-  if (
-    ageDays !== null &&
-    ageDays <= 30 &&
-    marketCap !== null &&
-    marketCap <= 2_000_000 &&
-    (flowMcapRatio ?? 0) >= 0.03 &&
-    edgeScore >= 50
-  ) {
-    return "🌱 Fresh Edge";
-  }
-
-  return "❔ Unknown";
+  return "flow_watch";
 }
 
 async function buildMemeResearchCards(rows: NetflowRow[]): Promise<MemeResearchCard[]> {
@@ -2203,12 +3583,13 @@ async function buildMemeResearchCards(rows: NetflowRow[]): Promise<MemeResearchC
     const name = toDisplayText(row.token_name ?? row.name, symbol);
     const marketCap = toFiniteNumber(row.market_cap_usd);
     const price = toFiniteNumber(row.price_usd ?? row.token_price_usd);
+    const liquidity = getFirstNumberFromRecords(row, [/liquidity/]);
     const flow24h = toFiniteNumber(row.net_flow_24h_usd);
     const flow7d = toFiniteNumber(row.net_flow_7d_usd);
     const traderCount = toFiniteNumber(row.trader_count);
     const ageDays = toFiniteNumber(row.token_age_days);
     const flowMcapRatio = marketCap && flow24h !== null ? flow24h / marketCap : null;
-    const isReFlow = ageDays !== null && ageDays >= 180;
+    const isReFlow = ageDays !== null && (ageDays >= 180 || (ageDays >= 31 && (flow24h ?? 0) > 0));
     const breakdown = calculateScoreBreakdown(row, flowMcapRatio);
     const edgeScore =
       clampScore(
@@ -2227,10 +3608,8 @@ async function buildMemeResearchCards(rows: NetflowRow[]): Promise<MemeResearchC
       flow7d,
       flowMcapRatio,
       traderCount,
-      ageDays,
-      edgeScore,
+      liquidity,
     });
-    const narrative = buildNarrative(row, symbol, name);
     const scoreBreakdown =
       `Flow/MCap: ${breakdown.flowMcap}/${scoringConfig.scoreWeights.flowMcap} | ` +
       `Smart Money: ${breakdown.smartMoney}/${scoringConfig.scoreWeights.smartMoneyFlow} | ` +
@@ -2249,11 +3628,15 @@ async function buildMemeResearchCards(rows: NetflowRow[]): Promise<MemeResearchC
       ageDays,
     );
     const risk = buildRisk(marketCap, flow7d, traderCount);
-    const dexscreenerUrl = `https://dexscreener.com/solana/${tokenAddress}`;
+    const dexscreenerUrl =
+      toOptionalText(row.dexscreener_url) ??
+      toOptionalText(row.dexscreenerUrl) ??
+      `https://dexscreener.com/solana/${tokenAddress}`;
     const gmgnUrl = `https://gmgn.ai/sol/token/${tokenAddress}`;
     const universalxUrl = `https://universalx.app/trade?assetId=101_${tokenAddress}`;
     const nansenUrl = `Nansen deep dive: /meme-token ${tokenAddress}`;
     const tokenIconUrl = await resolveTokenIconUrl(row, tokenAddress);
+    const hiddenNarrative = createHiddenTokenNarrative();
 
     return {
       signalId: randomUUID(),
@@ -2261,7 +3644,13 @@ async function buildMemeResearchCards(rows: NetflowRow[]): Promise<MemeResearchC
       tokenAddress,
       symbol,
       name,
-      narrative,
+      narrative: hiddenNarrative.narrativeSummary,
+      narrativeSummary: hiddenNarrative.narrativeSummary,
+      narrativeType: hiddenNarrative.narrativeType,
+      narrativeSources: JSON.stringify(hiddenNarrative.narrativeSources),
+      narrativeEvidence: JSON.stringify(hiddenNarrative.narrativeEvidence),
+      narrativeTags: JSON.stringify(hiddenNarrative.narrativeTags),
+      narrativeConfidence: hiddenNarrative.internalConfidence,
       signalType,
       edgeScore,
       status: getStatus(edgeScore),
@@ -2293,6 +3682,735 @@ async function buildMemeResearchCards(rows: NetflowRow[]): Promise<MemeResearchC
   return cards.sort((a, b) => b.edgeScore - a.edgeScore);
 }
 
+function getCandidateSources(row: NetflowRow): string[] {
+  const rawSources = [
+    "smart-money/netflow",
+    ...collectRecords(row)
+      .flatMap((record) => [record.source, record.sources, record.candidate_sources])
+      .flatMap((value) => Array.isArray(value) ? value : [value])
+      .filter((value): value is string => typeof value === "string" && value.trim().length > 0),
+  ];
+
+  return Array.from(new Set(rawSources.map((source) => source.trim()))).slice(0, 5);
+}
+
+function calculateMomentumComponents(candidate: Pick<FreshScanCandidate, "marketCap" | "flow24h" | "flow7d" | "flowMcapRatio" | "traderCount" | "ageDays" | "liquidity" | "candidateSources" | "riskFlags">): Record<string, number> {
+  const flow24h = Math.min(25, Math.round((Math.log10(Math.max(candidate.flow24h ?? 0, 0) + 1) / 6) * 25));
+  const flowMcap = Math.min(25, Math.round(((candidate.flowMcapRatio ?? 0) / 0.05) * 25));
+  const traders = candidate.traderCount === null
+    ? 0
+    : candidate.traderCount >= 10 ? 15 : candidate.traderCount >= 5 ? 11 : candidate.traderCount >= 3 ? 7 : candidate.traderCount >= 2 ? 4 : 0;
+  const flow7d = (candidate.flow7d ?? 0) > 0 ? Math.min(15, Math.round((Math.log10(Math.max(candidate.flow7d ?? 0, 0) + 1) / 6) * 15)) : 0;
+  const liquidity = candidate.liquidity === null
+    ? 4
+    : candidate.liquidity >= scoringConfig.freshScanRules.minLiquidityUsd ? 10 : candidate.liquidity >= 10_000 ? 5 : 0;
+  const age = candidate.ageDays === null
+    ? 4
+    : candidate.ageDays <= 1 ? 10 : candidate.ageDays <= 5 ? 8 : candidate.ageDays <= 30 ? 5 : 2;
+  const sourceConfirmation = Math.min(10, Math.max(0, (candidate.candidateSources.length - 1) * 5));
+  let riskPenalty = 0;
+
+  if (candidate.riskFlags.includes("thin_liquidity")) riskPenalty -= 10;
+  if (candidate.riskFlags.includes("bot_like")) riskPenalty -= 15;
+  if (candidate.riskFlags.includes("micro_mcap")) riskPenalty -= 8;
+  if (candidate.riskFlags.includes("negative_7d_flow")) riskPenalty -= 5;
+
+  return {
+    flow24h,
+    flowMcap,
+    traders,
+    flow7d,
+    liquidity,
+    age,
+    sourceConfirmation,
+    riskPenalty: Math.max(-30, riskPenalty),
+  };
+}
+
+function buildFreshScanCandidate(row: NetflowRow, scanId: string, candidateRank: number, createdAt: string): FreshScanCandidate {
+  const tokenAddress = toDisplayText(row.token_address, "UNKNOWN");
+  const symbol = toDisplayText(row.token_symbol, "UNKNOWN");
+  const name = toDisplayText(row.token_name ?? row.name, symbol);
+  const marketCap = toFiniteNumber(row.market_cap_usd);
+  const price = toFiniteNumber(row.price_usd ?? row.token_price_usd);
+  const flow24h = toFiniteNumber(row.net_flow_24h_usd);
+  const flow7d = toFiniteNumber(row.net_flow_7d_usd);
+  const traderCount = toFiniteNumber(row.trader_count);
+  const ageDays = toFiniteNumber(row.token_age_days);
+  const liquidity = getFirstNumberFromRecords(row, [/liquidity/]);
+  const warningFlags: string[] = [];
+
+  if (price === null) warningFlags.push("price_missing");
+  if (liquidity === null) warningFlags.push("liquidity_missing");
+  if (ageDays === null) warningFlags.push("age_missing");
+
+  const flowMcapRatio = marketCap && flow24h !== null ? flow24h / marketCap : null;
+  const candidateSources = getCandidateSources(row);
+  const riskFlags: string[] = [];
+
+  if (marketCap !== null && marketCap < scoringConfig.freshScanRules.minMcap) riskFlags.push("micro_mcap");
+  if (liquidity !== null && liquidity < scoringConfig.freshScanRules.minLiquidityUsd) riskFlags.push("thin_liquidity");
+  if ((traderCount ?? 0) <= 2 && (flow24h ?? 0) > 0 && (flow7d ?? 0) <= 0) riskFlags.push("bot_like");
+  if ((flow7d ?? 0) < 0) riskFlags.push("negative_7d_flow");
+
+  const components = calculateMomentumComponents({
+    marketCap,
+    flow24h,
+    flow7d,
+    flowMcapRatio,
+    traderCount,
+    ageDays,
+    liquidity,
+    candidateSources,
+    riskFlags,
+  });
+  const momentumScore = clampScore(Object.values(components).reduce((sum, value) => sum + value, 0));
+  const signalType = classifySignalType({
+    marketCap,
+    flow24h,
+    flow7d,
+    flowMcapRatio,
+    traderCount,
+    liquidity,
+  });
+
+  return {
+    scanId,
+    candidateRank,
+    row,
+    tokenAddress,
+    symbol,
+    name,
+    candidateSources,
+    marketCap,
+    price,
+    liquidity,
+    volume24h: null,
+    marketDataRefreshedAt: null,
+    marketDataAgeMinutes: null,
+    marketDataSource: null,
+    marketDataWarning: null,
+    flow24h,
+    flow7d,
+    flowMcapRatio,
+    traderCount,
+    ageDays,
+    gate0Status: "pass",
+    gate0Reason: "Gate 0通過",
+    hardRejectStatus: "pass",
+    hardRejectReason: "Hard Rejectなし",
+    riskFlags,
+    warningFlags,
+    rawDexscreenerSnapshot: null,
+    momentumScore,
+    momentumGateStatus: "fail",
+    momentumGateReason: "Momentum Gate未通過",
+    rankComponents: components,
+    preFilterStatus: "fail",
+    preFilterRank: null,
+    preFilterReason: "Pre-filter未通過",
+    cliCandidateScore: momentumScore,
+    whySelectedForCli: null,
+    cliChecked: false,
+    cliGrade: "Unchecked",
+    cliOracleStatus: "not_checked",
+    cliRejectReason: null,
+    finalRank: null,
+    finalRankReason: null,
+    posted: false,
+    postedMessageId: null,
+    score: momentumScore,
+    signalType,
+    exclusionReason: null,
+    createdAt,
+  };
+}
+
+function applyFreshScanGate0(candidate: FreshScanCandidate, cutoffIso: string, seen: Set<string>): void {
+  const reasons: string[] = [];
+
+  if (candidate.tokenAddress === "UNKNOWN") reasons.push("token addressなし");
+  if (seen.has(candidate.tokenAddress)) reasons.push("重複token");
+  if (candidate.marketCap === null) reasons.push("MCapなし");
+  if (candidate.flow24h === null || candidate.flow24h <= 0) reasons.push("24h Flowなし");
+  if ((candidate.traderCount ?? 0) < scoringConfig.freshScanRules.minTraders) reasons.push(`Traders ${formatCount(candidate.traderCount)}人`);
+  if (hasRecentSignal(candidate.tokenAddress, cutoffIso)) reasons.push(`${scoringConfig.freshScanRules.dedupeHours}h以内に投稿済み`);
+
+  seen.add(candidate.tokenAddress);
+
+  if (reasons.length > 0) {
+    candidate.gate0Status = "reject";
+    candidate.gate0Reason = reasons.join(" / ");
+    candidate.exclusionReason = candidate.gate0Reason;
+  }
+}
+
+function refreshFreshScanCandidateScoring(candidate: FreshScanCandidate): void {
+  const components = calculateMomentumComponents({
+    marketCap: candidate.marketCap,
+    flow24h: candidate.flow24h,
+    flow7d: candidate.flow7d,
+    flowMcapRatio: candidate.flowMcapRatio,
+    traderCount: candidate.traderCount,
+    ageDays: candidate.ageDays,
+    liquidity: candidate.liquidity,
+    candidateSources: candidate.candidateSources,
+    riskFlags: candidate.riskFlags,
+  });
+
+  candidate.rankComponents = components;
+  candidate.momentumScore = clampScore(Object.values(components).reduce((sum, value) => sum + value, 0));
+  candidate.score = candidate.momentumScore;
+  candidate.signalType = classifySignalType({
+    marketCap: candidate.marketCap,
+    flow24h: candidate.flow24h,
+    flow7d: candidate.flow7d,
+    flowMcapRatio: candidate.flowMcapRatio,
+    traderCount: candidate.traderCount,
+    liquidity: candidate.liquidity,
+  });
+}
+
+async function enrichFreshScanCandidates(candidates: FreshScanCandidate[]): Promise<void> {
+  for (const candidate of candidates) {
+    if (candidate.tokenAddress === "UNKNOWN") continue;
+
+    const enrichment = await enrichMarketDataForToken(candidate.tokenAddress, candidate);
+
+    candidate.marketCap = candidate.marketCap ?? enrichment.marketCap;
+    candidate.price = enrichment.price;
+    candidate.liquidity = enrichment.liquidity;
+    candidate.volume24h = enrichment.volume24h;
+    candidate.marketDataRefreshedAt = enrichment.refreshedAt;
+    candidate.marketDataAgeMinutes = enrichment.ageMinutes;
+    candidate.marketDataSource = enrichment.source;
+    candidate.marketDataWarning = enrichment.warning;
+    candidate.warningFlags = enrichment.warningFlags;
+    candidate.rawDexscreenerSnapshot = enrichment.rawSnapshot;
+    candidate.row.price_usd = candidate.row.price_usd ?? enrichment.price;
+    candidate.row.token_price_usd = candidate.row.token_price_usd ?? enrichment.price;
+    candidate.row.market_cap_usd = candidate.row.market_cap_usd ?? enrichment.marketCap;
+    candidate.row.dexscreener_url = candidate.row.dexscreener_url ?? enrichment.pairUrl;
+
+    if (candidate.liquidity !== null && candidate.liquidity < scoringConfig.freshScanRules.minLiquidityUsd && !candidate.riskFlags.includes("thin_liquidity")) {
+      candidate.riskFlags.push("thin_liquidity");
+    }
+
+    refreshFreshScanCandidateScoring(candidate);
+  }
+}
+
+function applyFreshScanHardReject(candidate: FreshScanCandidate): void {
+  if (candidate.gate0Status === "reject") return;
+
+  const reasons: string[] = [];
+  const rules = scoringConfig.freshScanRules;
+
+  if ((candidate.marketCap ?? 0) < rules.minMcap && (candidate.flow24h ?? 0) < rules.min24hFlowUsd) reasons.push("極小MCapかつflow不足");
+  if ((candidate.traderCount ?? 0) < rules.minTraders) reasons.push("単独flowに近い");
+  if (candidate.liquidity !== null && candidate.liquidity < 10_000) reasons.push("Liquidity $10K未満");
+  if ((candidate.flowMcapRatio ?? 0) >= rules.minFlowMcap && (candidate.flow24h ?? 0) < rules.min24hFlowUsd) reasons.push("Flow/MCapだけ高く24h Flowが小さい");
+  if (candidate.riskFlags.includes("bot_like")) reasons.push("bot-like / micro-arb疑い");
+  if (candidate.marketCap !== null && candidate.marketCap > rules.maxMcap && !rules.allowAboveMaxMcapIfStrong) reasons.push("MCap上限超え");
+
+  if (reasons.length > 0) {
+    candidate.hardRejectStatus = "reject";
+    candidate.hardRejectReason = reasons.join(" / ");
+    candidate.exclusionReason = candidate.hardRejectReason;
+  }
+}
+
+function applyFreshScanMomentumGate(candidates: FreshScanCandidate[]): FreshScanCandidate[] {
+  const passed = candidates
+    .filter((candidate) => candidate.gate0Status === "pass" && candidate.hardRejectStatus !== "reject")
+    .sort((a, b) => b.momentumScore - a.momentumScore)
+    .slice(0, scoringConfig.freshScanRules.momentumGateSize);
+
+  const passedSet = new Set(passed.map((candidate) => candidate.tokenAddress));
+
+  for (const candidate of candidates) {
+    if (passedSet.has(candidate.tokenAddress)) {
+      candidate.momentumGateStatus = "pass";
+      candidate.momentumGateReason = `Momentum Score ${candidate.momentumScore}/100で上位${scoringConfig.freshScanRules.momentumGateSize}入り`;
+    }
+  }
+
+  return passed;
+}
+
+function applyFreshScanPreFilter(momentumCandidates: FreshScanCandidate[]): FreshScanCandidate[] {
+  const ranked = [...momentumCandidates]
+    .map((candidate) => {
+      let score = candidate.momentumScore;
+
+      if ((candidate.flow24h ?? 0) >= scoringConfig.freshScanRules.min24hFlowUsd) score += 8;
+      if ((candidate.flowMcapRatio ?? 0) >= scoringConfig.freshScanRules.minFlowMcap) score += 8;
+      if ((candidate.traderCount ?? 0) >= 3) score += 5;
+      if ((candidate.flow7d ?? 0) > 0) score += 5;
+      if ((candidate.liquidity ?? 0) >= scoringConfig.freshScanRules.minLiquidityUsd) score += 4;
+      if (candidate.candidateSources.length > 1) score += 4;
+      if (candidate.riskFlags.length === 0) score += 3;
+      if ((candidate.traderCount ?? 0) <= 2) score -= 6;
+      if (candidate.liquidity !== null && candidate.liquidity < scoringConfig.freshScanRules.minLiquidityUsd) score -= 6;
+      if ((candidate.marketCap ?? 0) < scoringConfig.freshScanRules.minMcap) score -= 8;
+      if (candidate.marketCap !== null && candidate.marketCap > scoringConfig.freshScanRules.maxMcap) score -= 8;
+      if ((candidate.ageDays ?? 0) >= 5 && (candidate.flow24h ?? 0) < scoringConfig.freshScanRules.min24hFlowUsd) score -= 4;
+      if ((candidate.flow7d ?? 0) < 0) score -= 4;
+      if (candidate.riskFlags.includes("bot_like") || candidate.riskFlags.includes("thin_liquidity")) score -= 8;
+
+      candidate.cliCandidateScore = clampScore(score, 0, 120);
+
+      return candidate;
+    })
+    .sort((a, b) => b.cliCandidateScore - a.cliCandidateScore)
+    .slice(0, scoringConfig.freshScanRules.preFilterSize);
+
+  ranked.forEach((candidate, index) => {
+    candidate.preFilterStatus = "pass";
+    candidate.preFilterRank = index + 1;
+    candidate.preFilterReason = `CLI検証前スコア ${candidate.cliCandidateScore}/120`;
+  });
+
+  return ranked;
+}
+
+function gradeCliQuality(deepCheck: DeepCheckReply): { grade: CliGrade; reason: string | null; status: string } {
+  const flow = deepCheck.flowQuality.label;
+  const balance = deepCheck.buyerSellerBalance.label;
+  const holder = deepCheck.holderQuality.label;
+  const sell = deepCheck.sellPressure.label;
+  const cluster = deepCheck.clusterRisk.label;
+  const botLike = deepCheck.walletQuality.behaviorCounts["Micro-arb"] + deepCheck.walletQuality.behaviorCounts["Mirror-like"] >= 3;
+
+  if (balance === "Bearish" || sell === "High" || cluster === "High" || botLike || (holder === "High" && flow === "Weak")) {
+    return { grade: "Reject", reason: "CLI Quality Gate Reject", status: "checked" };
+  }
+
+  if (flow === "Strong" && balance === "Bullish") {
+    return { grade: "A", reason: null, status: "checked" };
+  }
+
+  if (flow === "Medium") {
+    return { grade: "B", reason: null, status: "checked" };
+  }
+
+  return { grade: "C", reason: null, status: "checked" };
+}
+
+async function applyFreshScanCliOracle(preFiltered: FreshScanCandidate[]): Promise<void> {
+  if (
+    scoringConfig.freshScanRules.mode === "data_collection" ||
+    !scoringConfig.freshScanRules.useCliOracle ||
+    scoringConfig.freshScanRules.cliOracleCheckSize <= 0
+  ) {
+    for (const candidate of preFiltered) {
+      candidate.cliChecked = false;
+      candidate.cliGrade = "Unchecked";
+      candidate.cliOracleStatus = "skipped_data_collection_mode";
+    }
+    return;
+  }
+
+  const candidates = preFiltered.slice(0, scoringConfig.freshScanRules.cliOracleCheckSize);
+
+  for (const candidate of candidates) {
+    candidate.whySelectedForCli = `Pre-filter #${candidate.preFilterRank ?? "-"} / score ${candidate.cliCandidateScore}`;
+    candidate.cliChecked = true;
+
+    try {
+      const tracking = await withNansenCreditTracking(`fresh-scan-cli-oracle:${candidate.tokenAddress}`, () => buildDeepCheckReply(candidate.tokenAddress));
+
+      if ((tracking.usedCredits ?? 0) > scoringConfig.freshScanRules.maxCliCreditsPerRun) {
+        candidate.cliOracleStatus = "skipped_credit_guard";
+        candidate.cliGrade = "C";
+        continue;
+      }
+
+      const gate = gradeCliQuality(tracking.result);
+
+      candidate.cliGrade = gate.grade;
+      candidate.cliOracleStatus = gate.status;
+      candidate.cliRejectReason = gate.reason;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "不明なエラー";
+
+      candidate.cliGrade = "C";
+      candidate.cliOracleStatus = `failed: ${message}`;
+    }
+  }
+}
+
+function selectFreshScanFinalCandidates(candidates: FreshScanCandidate[]): FreshScanCandidate[] {
+  const gradeWeight: Record<CliGrade, number> = { A: 4, B: 3, C: 2, Unchecked: 1, Reject: 0 };
+  const eligible = candidates
+    .filter((candidate) => candidate.preFilterStatus === "pass")
+    .filter((candidate) => candidate.cliGrade !== "Reject")
+    .sort((a, b) => {
+      const gradeDiff = gradeWeight[b.cliGrade] - gradeWeight[a.cliGrade];
+
+      if (gradeDiff !== 0) return gradeDiff;
+
+      return b.score - a.score;
+    });
+  const selected: FreshScanCandidate[] = [];
+  const signalCounts = new Map<SignalType, number>();
+  let largeMcapCount = 0;
+  let riskCount = 0;
+
+  for (const candidate of eligible) {
+    if (selected.length >= scoringConfig.freshScanRules.maxSignalsPerRun) break;
+
+    const signalCount = signalCounts.get(candidate.signalType) ?? 0;
+    const isLargeMcap = (candidate.marketCap ?? 0) >= scoringConfig.freshScanRules.largeMcapThreshold;
+    const isRisk = candidate.signalType === "thin_liquidity" || candidate.signalType === "bot_like_flow";
+
+    if (signalCount >= scoringConfig.freshScanRules.maxPerSignalType && scoringConfig.freshScanRules.forceDiversity) continue;
+    if (isLargeMcap && largeMcapCount >= scoringConfig.freshScanRules.maxLargeMcapPerRun) continue;
+    if (isRisk && riskCount >= scoringConfig.freshScanRules.maxRiskSignalsPerRun) continue;
+
+    selected.push(candidate);
+    signalCounts.set(candidate.signalType, signalCount + 1);
+    if (isLargeMcap) largeMcapCount += 1;
+    if (isRisk) riskCount += 1;
+  }
+
+  selected.forEach((candidate, index) => {
+    candidate.finalRank = index + 1;
+    candidate.finalRankReason = `CLI Grade ${candidate.cliGrade} / score ${candidate.score}`;
+  });
+
+  for (const candidate of candidates) {
+    if (candidate.finalRank === null && !candidate.exclusionReason) {
+      candidate.exclusionReason = candidate.cliGrade === "Reject" ? candidate.cliRejectReason : "Final Selection外";
+    }
+  }
+
+  return selected;
+}
+
+function serializeFreshScanCandidate(candidate: FreshScanCandidate) {
+  return {
+    scan_id: candidate.scanId,
+    token_address: candidate.tokenAddress,
+    symbol: candidate.symbol,
+    name: candidate.name,
+    candidate_rank: candidate.candidateRank,
+    candidate_sources: JSON.stringify(candidate.candidateSources),
+    mcap: candidate.marketCap,
+    price: candidate.price,
+    entry_price: candidate.price,
+    age_days: candidate.ageDays,
+    liquidity: candidate.liquidity,
+    volume_24h: candidate.volume24h,
+    market_data_refreshed_at: candidate.marketDataRefreshedAt,
+    market_data_age_minutes: candidate.marketDataAgeMinutes,
+    market_data_source: candidate.marketDataSource,
+    market_data_warning: candidate.marketDataWarning,
+    raw_dexscreener_snapshot: JSON.stringify(candidate.rawDexscreenerSnapshot ?? null),
+    flow_24h: candidate.flow24h,
+    flow_7d: candidate.flow7d,
+    flow_mcap: candidate.flowMcapRatio,
+    traders: candidate.traderCount,
+    gate_0_status: candidate.gate0Status,
+    gate_0_reason: candidate.gate0Reason,
+    hard_reject_status: candidate.hardRejectStatus,
+    hard_reject_reason: candidate.hardRejectReason,
+    risk_flags: JSON.stringify(candidate.riskFlags),
+    momentum_score: candidate.momentumScore,
+    momentum_gate_status: candidate.momentumGateStatus,
+    momentum_gate_reason: candidate.momentumGateReason,
+    fresh_scan_rank_score: candidate.score,
+    fresh_scan_rank_components: JSON.stringify(candidate.rankComponents),
+    pre_filter_status: candidate.preFilterStatus,
+    pre_filter_rank: candidate.preFilterRank,
+    pre_filter_reason: candidate.preFilterReason,
+    cli_candidate_score: candidate.cliCandidateScore,
+    why_selected_for_cli: candidate.whySelectedForCli,
+    cli_checked: candidate.cliChecked ? 1 : 0,
+    cli_grade: candidate.cliGrade,
+    cli_oracle_status: candidate.cliOracleStatus,
+    cli_reject_reason: candidate.cliRejectReason,
+    final_rank: candidate.finalRank,
+    final_rank_reason: candidate.finalRankReason,
+    posted: candidate.posted ? 1 : 0,
+    posted_message_id: candidate.postedMessageId,
+    score: candidate.score,
+    signal_type: candidate.signalType,
+    exclusion_reason: candidate.exclusionReason,
+    rank_bucket: candidate.score >= 85 ? "top" : candidate.score >= 70 ? "strong" : candidate.score >= 50 ? "watch" : "low",
+    positive_flags: JSON.stringify([
+      candidate.flowMcapRatio !== null && candidate.flowMcapRatio >= scoringConfig.freshScanRules.minFlowMcap ? "flow_mcap_pass" : null,
+      (candidate.traderCount ?? 0) >= scoringConfig.freshScanRules.minTraders ? "traders_pass" : null,
+    ].filter(Boolean)),
+    warning_flags: JSON.stringify(Array.from(new Set([...candidate.warningFlags, ...candidate.riskFlags]))),
+    pass_reason_codes: JSON.stringify([
+      candidate.gate0Status === "pass" ? "fresh_gate_0_pass" : null,
+      candidate.preFilterStatus === "pass" ? "fresh_pre_filter_pass" : null,
+      candidate.finalRank !== null ? "fresh_final_selected" : null,
+    ].filter(Boolean)),
+    reject_reason_codes: JSON.stringify(candidate.exclusionReason ? [candidate.exclusionReason.toLowerCase().replace(/[^a-z0-9]+/g, "_")] : []),
+    created_at: candidate.createdAt,
+  };
+}
+
+async function buildFreshScanV2(
+  rows: NetflowRow[],
+  source: NansenDataSource,
+  label: MemeScanLabel,
+  fetchMetadata: NansenFetchMetadata,
+): Promise<{ candidates: FreshScanCandidate[]; selectedRows: NetflowRow[]; scanId: string; scanTime: string }> {
+  const scanId = randomUUID();
+  const scanTime = new Date().toISOString();
+  const pool = rows.slice(0, scoringConfig.freshScanRules.candidatePoolSize);
+  const candidates = pool.map((row, index) => buildFreshScanCandidate(row, scanId, index + 1, scanTime));
+  const cutoffIso = getRecentCutoffIso(scoringConfig.freshScanRules.dedupeHours);
+  const seen = new Set<string>();
+
+  for (const candidate of candidates) {
+    applyFreshScanGate0(candidate, cutoffIso, seen);
+    applyFreshScanHardReject(candidate);
+  }
+
+  const momentumCandidates = applyFreshScanMomentumGate(candidates);
+  await enrichFreshScanCandidates(momentumCandidates);
+  const preFiltered = applyFreshScanPreFilter(momentumCandidates);
+  await enrichFreshScanCandidates(preFiltered);
+
+  await applyFreshScanCliOracle(preFiltered);
+  if (scoringConfig.freshScanRules.mode === "data_collection") {
+    for (const candidate of candidates) {
+      if (!candidate.cliChecked) {
+        candidate.cliOracleStatus = "skipped_data_collection_mode";
+        candidate.cliGrade = "Unchecked";
+      }
+    }
+  }
+
+  const selected = selectFreshScanFinalCandidates(candidates);
+  await enrichFreshScanCandidates(selected);
+
+  try {
+    await freshScanStore.saveRun(
+      {
+        scan_id: scanId,
+        label,
+        source,
+        candidate_pool_size: candidates.length,
+        requested_candidate_pool_size: fetchMetadata.requestedCandidatePoolSize,
+        actual_candidate_pool_size: fetchMetadata.actualCandidatePoolSize,
+        nansen_page_limit: fetchMetadata.nansenPageLimit,
+        nansen_pagination_used: fetchMetadata.nansenPaginationUsed ? 1 : 0,
+        nansen_fetch_warning: fetchMetadata.nansenFetchWarning,
+        gate_0_count: candidates.filter((candidate) => candidate.gate0Status === "pass").length,
+        hard_reject_count: candidates.filter((candidate) => candidate.hardRejectStatus === "reject").length,
+        momentum_gate_count: momentumCandidates.length,
+        pre_filter_count: preFiltered.length,
+        cli_checked_count: candidates.filter((candidate) => candidate.cliChecked).length,
+        final_count: selected.length,
+        config_snapshot: JSON.stringify(scoringConfig.freshScanRules),
+        market_context: JSON.stringify({ source, label }),
+        credits_by_step: JSON.stringify({ cli_checked_count: candidates.filter((candidate) => candidate.cliChecked).length }),
+        created_at: scanTime,
+      },
+      candidates.map(serializeFreshScanCandidate),
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "不明なエラー";
+
+    console.warn(`Fresh Scan v2候補保存に失敗しました (${freshScanStore.provider}): ${message}`);
+  }
+
+  return {
+    candidates,
+    selectedRows: selected.map((candidate) => candidate.row),
+    scanId,
+    scanTime,
+  };
+}
+
+async function saveFreshCandidateTrackingSnapshot(
+  candidates: FreshScanCandidate[],
+  snapshotLabel: "1h" | "4h" | "12h" | "24h" | "48h" | "7d",
+): Promise<void> {
+  const snapshotTime = new Date().toISOString();
+
+  for (const candidate of candidates) {
+    if (candidate.tokenAddress === "UNKNOWN") continue;
+
+    try {
+      const data = await fetchDexScreenerMarketData(candidate.tokenAddress);
+      const currentMcap = data?.marketCap ?? null;
+      const returnX = candidate.marketCap && currentMcap ? currentMcap / candidate.marketCap : null;
+
+      await freshScanStore.savePerformanceSnapshot({
+        scan_id: candidate.scanId,
+        token_address: candidate.tokenAddress,
+        snapshot_label: snapshotLabel,
+        snapshot_time: snapshotTime,
+        mcap: currentMcap,
+        price: data?.price ?? null,
+        liquidity: data?.liquidity ?? null,
+        volume_24h: data?.volume24h ?? null,
+        return_x: returnX,
+        entry_mcap: candidate.marketCap,
+        created_at: snapshotTime,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "不明なエラー";
+
+      console.warn(`Fresh Scan candidate snapshotに失敗しました: ${candidate.tokenAddress} ${snapshotLabel} ${message}`);
+    }
+  }
+}
+
+function scheduleFreshCandidateTracking(candidates: FreshScanCandidate[]): void {
+  if (!scoringConfig.freshScanRules.trackAllCandidates || candidates.length === 0) return;
+
+  const jobs: Array<{ label: "1h" | "4h" | "12h" | "24h" | "48h" | "7d"; delayMs: number }> = [
+    { label: "1h", delayMs: 60 * 60 * 1000 },
+    { label: "4h", delayMs: 4 * 60 * 60 * 1000 },
+    { label: "12h", delayMs: 12 * 60 * 60 * 1000 },
+    { label: "24h", delayMs: 24 * 60 * 60 * 1000 },
+    { label: "48h", delayMs: 48 * 60 * 60 * 1000 },
+    { label: "7d", delayMs: 7 * 24 * 60 * 60 * 1000 },
+  ];
+
+  for (const job of jobs) {
+    setTimeout(() => {
+      void saveFreshCandidateTrackingSnapshot(candidates, job.label);
+    }, job.delayMs);
+  }
+}
+
+function formatPumpReturnX(value: number): string {
+  return `${value.toFixed(2)}x`;
+}
+
+function getTokenLinks(tokenAddress: string): string {
+  return [
+    `[DexScreener](https://dexscreener.com/solana/${tokenAddress})`,
+    `[GMGN](https://gmgn.ai/sol/token/${tokenAddress})`,
+    `[UniversalX](https://universalx.app/trade?assetId=101_${tokenAddress})`,
+  ].join("｜");
+}
+
+function trackingSnapshotLabelToHours(label: "1h" | "4h" | "12h" | "24h" | "48h" | "7d"): number {
+  return Number(label.replace("h", "").replace("d", "")) * (label.endsWith("d") ? 24 : 1);
+}
+
+async function maybePostAlertPumpNotification(
+  candidate: AlertV2Candidate,
+  snapshotLabel: "1h" | "4h" | "12h" | "24h" | "48h" | "7d",
+  marketData: DexScreenerMarketData | null,
+  returnX: number | null,
+  channel: SendableChannel,
+  notifiedAt: string,
+): Promise<void> {
+  const threshold = 2;
+
+  if (!candidate.posted || returnX === null || returnX < threshold) {
+    return;
+  }
+
+  const currentMcap = marketData?.marketCap ?? null;
+  const timeToPeakHours = trackingSnapshotLabelToHours(snapshotLabel);
+  const insertResult = insertAlertPumpNotification.run(
+    randomUUID(),
+    candidate.alertRunId,
+    candidate.tokenAddress,
+    threshold,
+    returnX,
+    candidate.entryMcap,
+    currentMcap,
+    timeToPeakHours,
+    snapshotLabel,
+    channel.id ?? null,
+    notifiedAt,
+  ) as { changes: number };
+
+  if (insertResult.changes === 0) {
+    return;
+  }
+
+  const symbol = candidate.symbol && candidate.symbol !== "UNKNOWN"
+    ? formatDisplaySymbol(candidate.symbol)
+    : shortenAddress(candidate.tokenAddress);
+  const message = await channel.send({
+    embeds: [
+      new EmbedBuilder()
+        .setTitle("🚀 Alert Pump Hit")
+        .setDescription(`${symbol} が Alert後に ${formatPumpReturnX(returnX)} 到達`)
+        .addFields(
+          { name: "検出時MCap", value: formatCompactUsd(candidate.entryMcap), inline: true },
+          { name: "現在MCap", value: formatCompactUsd(currentMcap), inline: true },
+          { name: "到達時間", value: `${timeToPeakHours}h`, inline: true },
+          { name: "Source", value: "Alert", inline: true },
+          { name: "CA", value: `\`${candidate.tokenAddress}\`` },
+          { name: "Links", value: getTokenLinks(candidate.tokenAddress) },
+        )
+        .setTimestamp(new Date(notifiedAt)),
+    ],
+  });
+
+  updateAlertPumpNotificationMessage.run(message.id, candidate.tokenAddress, threshold);
+}
+
+async function saveAlertCandidateTrackingSnapshot(
+  candidates: AlertV2Candidate[],
+  snapshotLabel: "1h" | "4h" | "12h" | "24h" | "48h" | "7d",
+  channel: SendableChannel,
+): Promise<void> {
+  const snapshotTime = new Date().toISOString();
+
+  for (const candidate of candidates) {
+    if (candidate.tokenAddress === "UNKNOWN") continue;
+
+    try {
+      const data = await fetchDexScreenerMarketData(candidate.tokenAddress);
+      const currentMcap = data?.marketCap ?? null;
+      const returnX = candidate.entryMcap && currentMcap ? currentMcap / candidate.entryMcap : null;
+
+      await alertStore.savePerformanceSnapshot({
+        alert_run_id: candidate.alertRunId,
+        token_address: candidate.tokenAddress,
+        snapshot_label: snapshotLabel,
+        snapshot_time: snapshotTime,
+        mcap: currentMcap,
+        price: data?.price ?? null,
+        liquidity: data?.liquidity ?? null,
+        volume_24h: data?.volume24h ?? null,
+        return_x: returnX,
+        entry_mcap: candidate.entryMcap,
+        created_at: snapshotTime,
+      });
+      await maybePostAlertPumpNotification(candidate, snapshotLabel, data, returnX, channel, snapshotTime);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "不明なエラー";
+
+      console.warn(`Alert candidate snapshotに失敗しました: ${candidate.tokenAddress} ${snapshotLabel} ${message}`);
+    }
+  }
+}
+
+function scheduleAlertCandidateTracking(candidates: AlertV2Candidate[], channel: SendableChannel): void {
+  if (!scoringConfig.alertRules.trackAllCandidates || candidates.length === 0) return;
+
+  const jobs: Array<{ label: "1h" | "4h" | "12h" | "24h" | "48h" | "7d"; delayMs: number }> = [
+    { label: "1h", delayMs: 60 * 60 * 1000 },
+    { label: "4h", delayMs: 4 * 60 * 60 * 1000 },
+    { label: "12h", delayMs: 12 * 60 * 60 * 1000 },
+    { label: "24h", delayMs: 24 * 60 * 60 * 1000 },
+    { label: "48h", delayMs: 48 * 60 * 60 * 1000 },
+    { label: "7d", delayMs: 7 * 24 * 60 * 60 * 1000 },
+  ];
+
+  for (const job of jobs) {
+    setTimeout(() => {
+      void saveAlertCandidateTrackingSnapshot(candidates, job.label, channel);
+    }, job.delayMs);
+  }
+}
+
 function getFreshScanCards(cards: MemeResearchCard[]): MemeResearchCard[] {
   const rules = scoringConfig.freshScanRules;
   const cutoffIso = getRecentCutoffIso(rules.dedupeHours);
@@ -2322,12 +4440,6 @@ function getFreshScanCards(cards: MemeResearchCard[]): MemeResearchCard[] {
 
       if ((card.flow24h ?? 0) <= 0 || card.edgeScore < 50) {
         return false;
-      }
-
-      if (card.isReFlow) {
-        return Boolean(rules.allowReFlowIfStrong) &&
-          card.edgeScore >= 65 &&
-          ((card.flowMcapRatio ?? 0) >= scoringConfig.alertRules.minFlowMcap || (card.flow24h ?? 0) >= scoringConfig.alertRules.min24hFlowUsd);
       }
 
       return true;
@@ -2392,20 +4504,30 @@ function buildResearchCardEmbed(
     `[DexScreener](${card.dexscreenerUrl})`,
     `[GMGN](${card.gmgnUrl})`,
     `[UniversalX](${card.universalxUrl})`,
-  ].join(" | ");
+  ].join("｜");
   const whyFlagged = card.whyFlagged.replace(/^- /gm, "• ");
+  const riskLabels = getResearchCardRiskLabels(card);
   const description = [
-    `**Score:** ${card.edgeScore}/100 ${card.status}`,
-    `**Signal:** ${card.signalType}`,
-    `**MCap:** ${formatCompactUsd(card.marketCap)}`,
+    "**判定**",
+    ...formatTreeRows([
+      ["Score", `${card.edgeScore}/100 ${card.status}`],
+      ["Signal", formatSignalTypeLabel(card.signalType)],
+      ["Risk", formatDisplayRiskLine(riskLabels)],
+    ]),
+    "",
+    "**Stats**",
+    ...formatTreeRows([
+      ["MCap", formatCompactUsd(card.marketCap)],
+      ["Age", card.ageDays !== null ? `${card.ageDays.toFixed(1)}日` : card.tokenAge],
+    ]),
+    "",
     `**CA:** \`${card.tokenAddress}\``,
     `**関連リンク:**\n${relatedLinks}`,
-    `**ナラティブ:** ${card.narrative}`,
     `**検出理由:**\n${whyFlagged}`,
-  ].join("\n\n");
+  ].join("\n");
 
   const embed = new EmbedBuilder()
-    .setTitle(`#${index + 1} ${card.symbol} / ${card.name}`)
+    .setTitle(`#${index + 1} ${cleanDisplaySymbol(card.symbol)} / ${card.name}`)
     .setColor(getStatusColor(card.status))
     .setDescription(description)
     .setTimestamp(new Date(card.scanTime));
@@ -2417,8 +4539,243 @@ function buildResearchCardEmbed(
   return embed;
 }
 
-function getAlertType(card: MemeResearchCard): AlertType {
-  return card.isReFlow ? "re_flow" : "fresh_edge";
+function getAlertType(): AlertType {
+  return "alert_edge";
+}
+
+function calculateFreshnessMinutes(sourceDetectedAt: string, now = Date.now()): number {
+  const detected = new Date(sourceDetectedAt).getTime();
+
+  return Number.isFinite(detected) ? Math.max(0, Math.round((now - detected) / 60_000)) : 999_999;
+}
+
+function scoreAlertFreshness(minutes: number): number {
+  for (const bucket of scoringConfig.alertRules.freshnessScore.buckets) {
+    if (bucket.maxMinutes === null || minutes <= bucket.maxMinutes) {
+      return Math.min(scoringConfig.alertRules.freshnessScore.maxPoints, bucket.score);
+    }
+  }
+
+  return 0;
+}
+
+function sourceTypeLabel(sourceType: AlertCandidateSourceType): string {
+  switch (sourceType) {
+    case "fresh_scan_reaccelerated":
+      return "Fresh Re-Acceleration";
+    case "watch_reaccelerated":
+      return "Watch Re-Acceleration";
+    case "cli_near_miss_recheck":
+      return "CLI Near-Miss Recheck";
+    case "nansen_new":
+    default:
+      return "Nansen New";
+  }
+}
+
+function buildAlertMomentumComponents(candidate: AlertV2Candidate): Record<string, number> {
+  const shortTermFlow = Math.max(candidate.flow1h ?? 0, candidate.flow4h ?? 0);
+  const flowMcap = candidate.flowMcapRatio ?? 0;
+  const flow24h = candidate.flow24h ?? 0;
+  const traders = candidate.traderCount ?? 0;
+  const liquidity = candidate.liquidity ?? 0;
+  const riskPenalty = Math.max(-30, -(
+    (candidate.riskFlags.includes("thin_liquidity") ? 8 : 0) +
+    (candidate.riskFlags.includes("old_without_reacceleration") ? 10 : 0) +
+    (candidate.riskFlags.includes("recent_alert_dedupe") ? 12 : 0)
+  ));
+
+  return {
+    shortTermFlowAcceleration: Math.min(25, Math.round((Math.log10(shortTermFlow + 1) / 5) * 25)),
+    flowMcapImpact: Math.min(25, Math.round((flowMcap / 0.08) * 25)),
+    flow24hStrength: Math.min(15, Math.round((Math.log10(flow24h + 1) / 5) * 15)),
+    tradersConfirmation: traders >= 12 ? 15 : traders >= 8 ? 12 : traders >= 5 ? 9 : traders >= 3 ? 6 : 0,
+    liquidityQuality: liquidity >= 100_000 ? 10 : liquidity >= scoringConfig.alertRules.minLiquidityUsd ? 7 : liquidity > 0 ? 2 : 0,
+    freshnessScore: scoreAlertFreshness(candidate.candidateFreshnessMinutes),
+    ageRelevance: candidate.ageDays === null ? 2 : candidate.ageDays <= 1 ? 5 : candidate.ageDays <= 5 ? 4 : candidate.ageDays <= 30 ? 2 : 0,
+    flow7dContinuity: (candidate.flow7d ?? 0) > 0 ? 5 : 0,
+    sourceConfirmation: Math.min(5, Math.max(0, candidate.candidateSources.length - 1) * 3),
+    riskPenalty,
+  };
+}
+
+function createAlertCardFromCandidate(candidate: AlertV2Candidate): MemeResearchCard {
+  const signalId = randomUUID();
+  const tokenAddress = candidate.tokenAddress;
+  const pairUrl = getFirstTextFromRecords(candidate.rawDexscreenerSnapshot, [/^url$/]);
+
+  return {
+    signalId,
+    scanId: candidate.alertRunId,
+    tokenAddress,
+    symbol: candidate.symbol,
+    name: candidate.name,
+    narrative: "",
+    narrativeSummary: "",
+    narrativeType: "flow_driven",
+    narrativeSources: "[]",
+    narrativeEvidence: "[]",
+    narrativeTags: "[]",
+    narrativeConfidence: "Low",
+    signalType: "alert_edge",
+    edgeScore: candidate.alertMomentumScore,
+    status: getStatus(candidate.alertMomentumScore),
+    scoreBreakdown: JSON.stringify(candidate.alertMomentumComponents),
+    summary: `Alert v2: MCap ${formatCompactUsd(candidate.marketCap)} / Flow-MCap ${formatPercent(candidate.flowMcapRatio)}`,
+    scanTime: candidate.createdAt,
+    marketCap: candidate.marketCap,
+    price: candidate.price,
+    flow24h: candidate.flow24h,
+    flow7d: candidate.flow7d,
+    flowMcapRatio: candidate.flowMcapRatio,
+    traderCount: candidate.traderCount,
+    tokenAge: candidate.ageDays === null ? "不明" : `${candidate.ageDays.toFixed(1)}日`,
+    whyFlagged: candidate.preFilterReason,
+    risk: candidate.riskFlags.join(" / ") || "Quality Gateで確認",
+    tokenIconUrl: null,
+    dexscreenerUrl: isValidHttpUrl(pairUrl) ? pairUrl : `https://dexscreener.com/solana/${tokenAddress}`,
+    gmgnUrl: `https://gmgn.ai/sol/token/${tokenAddress}`,
+    universalxUrl: `https://universalx.app/trade?assetId=101_${tokenAddress}`,
+    nansenUrl: "",
+    ageDays: candidate.ageDays,
+    isReFlow: candidate.isReaccelerated,
+  };
+}
+
+function buildAlertV2Candidate(params: {
+  alertRunId: string;
+  tokenAddress: string;
+  symbol: string | null;
+  name: string | null;
+  sourceType: AlertCandidateSourceType;
+  sourceDetectedAt: string;
+  marketCap: number | null;
+  price: number | null;
+  ageDays: number | null;
+  liquidity: number | null;
+  flow1h?: number | null;
+  flow4h?: number | null;
+  flow24h: number | null;
+  flow7d: number | null;
+  traderCount: number | null;
+  sourceMarketCap?: number | null;
+  sourceFlow24h?: number | null;
+  sourceTraders?: number | null;
+  fromFreshScanId?: string | null;
+  fromScanCandidateId?: string | null;
+  fromWatchPickId?: string | null;
+  rawDexscreenerSnapshot?: unknown;
+  candidateRank: number;
+}): AlertV2Candidate {
+  const nowIso = new Date().toISOString();
+  const candidateFreshnessMinutes = calculateFreshnessMinutes(params.sourceDetectedAt);
+  const marketDataAgeMinutes = 0;
+  const flowMcapRatio = params.marketCap && params.flow24h !== null ? params.flow24h / params.marketCap : null;
+  const reaccelerationReasons: string[] = [];
+  const rules = scoringConfig.alertRules.reaccelerationRules;
+
+  if (rules.enabled) {
+    if (params.sourceMarketCap && params.marketCap && params.marketCap >= params.sourceMarketCap * rules.minMcapMultipleFromSource) {
+      reaccelerationReasons.push("mcap_1_5x");
+    }
+    if (params.sourceFlow24h && params.flow24h && params.flow24h >= params.sourceFlow24h * rules.minFlow24hMultipleFromSource) {
+      reaccelerationReasons.push("flow24h_1_5x");
+    }
+    if (params.sourceTraders && params.traderCount && params.traderCount >= params.sourceTraders * rules.minTradersMultipleFromSource) {
+      reaccelerationReasons.push("traders_1_5x");
+    }
+    if ((flowMcapRatio ?? 0) >= scoringConfig.alertRules.minFlowMcap) {
+      reaccelerationReasons.push("flow_mcap_alert_threshold");
+    }
+  }
+
+  const isOldSource = candidateFreshnessMinutes > 60;
+  const isReaccelerated = params.sourceType === "nansen_new" ? false : reaccelerationReasons.length > 0;
+  const riskFlags: string[] = [];
+
+  if (params.liquidity !== null && params.liquidity < scoringConfig.alertRules.minLiquidityUsd) riskFlags.push("thin_liquidity");
+  if (isOldSource && !isReaccelerated) riskFlags.push("old_without_reacceleration");
+
+  const candidate: AlertV2Candidate = {
+    alertRunId: params.alertRunId,
+    tokenAddress: params.tokenAddress,
+    symbol: params.symbol ?? "UNKNOWN",
+    name: params.name ?? params.symbol ?? "UNKNOWN",
+    candidateRank: params.candidateRank,
+    candidateSourceType: params.sourceType,
+    candidateSources: [params.sourceType],
+    sourceQuotaBucket: params.sourceType,
+    sourcePriority: params.sourceType === "nansen_new" ? 1 : params.sourceType === "fresh_scan_reaccelerated" ? 2 : 3,
+    sourceDetectedAt: params.sourceDetectedAt,
+    candidateFreshnessMinutes,
+    marketDataRefreshedAt: nowIso,
+    marketDataAgeMinutes,
+    marketDataSource: params.rawDexscreenerSnapshot ? "dexscreener" : null,
+    marketDataWarning: null,
+    fromFreshScanId: params.fromFreshScanId ?? null,
+    fromScanCandidateId: params.fromScanCandidateId ?? null,
+    fromPreviousAlertRunId: null,
+    fromWatchPickId: params.fromWatchPickId ?? null,
+    isReaccelerated,
+    reaccelerationReason: reaccelerationReasons.join(", ") || null,
+    marketCap: params.marketCap,
+    price: params.price,
+    ageDays: params.ageDays,
+    liquidity: params.liquidity,
+    volume24h: null,
+    flow1h: params.flow1h ?? null,
+    flow4h: params.flow4h ?? null,
+    flow24h: params.flow24h,
+    flow7d: params.flow7d,
+    flowMcapRatio,
+    traderCount: params.traderCount,
+    gate0Status: "pass",
+    gate0Reason: "未判定",
+    alertMomentumScore: 0,
+    alertMomentumComponents: {},
+    preFilterStatus: "fail",
+    preFilterRank: null,
+    preFilterReason: "Pre-filter未通過",
+    cliChecked: false,
+    cliGrade: "Unchecked",
+    cliOracleStatus: "not_checked",
+    rawCliSummary: null,
+    flowQuality: null,
+    holderRisk: null,
+    buyerSellerBalance: null,
+    sellPressure: null,
+    walletQuality: null,
+    clusterRisk: null,
+    qualityGateGrade: null,
+    qualityGateReasons: [],
+    qualityGateWarnings: [],
+    positiveFlags: [],
+    riskFlags,
+    warningFlags: [],
+    passReasonCodes: [],
+    rejectReasonCodes: [],
+    rankBucket: null,
+    finalRank: null,
+    posted: false,
+    postedMessageId: null,
+    entryMcap: params.marketCap,
+    entryPrice: params.price,
+    rawDexscreenerSnapshot: params.rawDexscreenerSnapshot ?? null,
+    createdAt: nowIso,
+    card: {} as MemeResearchCard,
+    isRealert: false,
+    realertReason: null,
+  };
+
+  candidate.alertMomentumComponents = buildAlertMomentumComponents(candidate);
+  candidate.alertMomentumScore = clampScore(Object.values(candidate.alertMomentumComponents).reduce((sum, value) => sum + value, 0));
+  candidate.rankBucket = candidate.alertMomentumScore >= 85 ? "top" : candidate.alertMomentumScore >= 75 ? "strong" : candidate.alertMomentumScore >= 60 ? "watch" : "low";
+  if (candidate.price === null) candidate.warningFlags.push("price_missing");
+  if (candidate.liquidity === null) candidate.warningFlags.push("liquidity_missing");
+  if (candidate.ageDays === null) candidate.warningFlags.push("age_missing");
+  candidate.card = createAlertCardFromCandidate(candidate);
+
+  return candidate;
 }
 
 function getAlertReasonLines(card: MemeResearchCard): string[] {
@@ -2458,6 +4815,279 @@ function isAlertCandidate(card: MemeResearchCard): boolean {
   return true;
 }
 
+function applyAlertGate0(candidate: AlertV2Candidate, seen: Set<string>): void {
+  const rules = scoringConfig.alertRules;
+  const reasons: string[] = [];
+
+  if (candidate.tokenAddress === "UNKNOWN") reasons.push("token_addressなし");
+  if (seen.has(candidate.tokenAddress)) reasons.push("重複token");
+  if (candidate.marketCap === null) reasons.push("MCapなし");
+  if (candidate.marketCap !== null && candidate.marketCap < rules.minMcap) reasons.push("MCap下限未満");
+  if (candidate.marketCap !== null && candidate.marketCap > rules.maxMcap) reasons.push("MCap上限超え");
+  if (candidate.liquidity === null) {
+    reasons.push("liquidity_missing");
+    if (!candidate.warningFlags.includes("liquidity_missing")) candidate.warningFlags.push("liquidity_missing");
+    if (!candidate.riskFlags.includes("liquidity_missing")) candidate.riskFlags.push("liquidity_missing");
+  } else if (candidate.liquidity < rules.minLiquidityUsd) {
+    reasons.push("Liquidity不足");
+  }
+  if ((candidate.flow24h ?? 0) < rules.min24hFlowUsd) reasons.push("24h Flow不足");
+  if ((candidate.flowMcapRatio ?? 0) < rules.minFlowMcap) reasons.push("Flow/MCap不足");
+  if ((candidate.traderCount ?? 0) < rules.minTraders) reasons.push("Traders不足");
+  if (candidate.marketDataAgeMinutes > rules.maxMarketDataAgeMinutes) reasons.push("market dataが古い");
+  if (candidate.riskFlags.includes("old_without_reacceleration")) reasons.push("古いsourceで再加速なし");
+
+  const latestAlert = getLatestAlertByToken.get(candidate.tokenAddress) as {
+    alert_id: string;
+    alert_run_id: string | null;
+    mcap: number | null;
+    flow_24h: number | null;
+    traders: number | null;
+    cli_grade: string | null;
+    triggered_at: string;
+  } | undefined;
+
+  if (latestAlert) {
+    const hoursSince = (Date.now() - new Date(latestAlert.triggered_at).getTime()) / 3_600_000;
+    const withinDedupe = hoursSince < rules.dedupeHours;
+    const canRealert = rules.reAlert.enabled &&
+      hoursSince >= rules.reAlert.minHoursSinceLastAlert &&
+      (
+        (latestAlert.mcap && candidate.marketCap && candidate.marketCap >= latestAlert.mcap * rules.reAlert.mcapMultipleFromLastAlert) ||
+        (latestAlert.flow_24h && candidate.flow24h && candidate.flow24h >= latestAlert.flow_24h * rules.reAlert.flow24hMultipleFromLastAlert) ||
+        (latestAlert.traders && candidate.traderCount && candidate.traderCount >= latestAlert.traders * rules.reAlert.tradersMultipleFromLastAlert)
+      );
+
+    if (withinDedupe && !canRealert) {
+      reasons.push(`${rules.dedupeHours}h以内にAlert済み`);
+      candidate.riskFlags.push("recent_alert_dedupe");
+    } else if (canRealert) {
+      candidate.isRealert = true;
+      candidate.realertReason = "二段目条件を満たしたため再Alert候補";
+    }
+  }
+
+  seen.add(candidate.tokenAddress);
+
+  if (reasons.length > 0) {
+    candidate.gate0Status = "reject";
+    candidate.gate0Reason = reasons.join(" / ");
+    candidate.rejectReasonCodes = reasons.map((reason) => reason.toLowerCase().replace(/[^a-z0-9]+/g, "_")).filter(Boolean);
+  } else {
+    candidate.gate0Status = "pass";
+    candidate.gate0Reason = "Alert Gate 0通過";
+    candidate.passReasonCodes.push("alert_gate_0_pass");
+  }
+}
+
+async function enrichAlertCandidatesBeforeGate(candidates: AlertV2Candidate[]): Promise<void> {
+  for (const candidate of candidates) {
+    if (candidate.tokenAddress === "UNKNOWN") continue;
+
+    const enrichment = await enrichMarketDataForToken(candidate.tokenAddress, candidate);
+
+    candidate.marketCap = candidate.marketCap ?? enrichment.marketCap;
+    candidate.price = enrichment.price;
+    candidate.entryPrice = candidate.entryPrice ?? enrichment.entryPrice;
+    candidate.liquidity = enrichment.liquidity;
+    candidate.volume24h = enrichment.volume24h;
+    candidate.marketDataRefreshedAt = enrichment.refreshedAt;
+    candidate.marketDataAgeMinutes = enrichment.ageMinutes;
+    candidate.marketDataSource = enrichment.source;
+    candidate.marketDataWarning = enrichment.warning;
+    candidate.warningFlags = enrichment.warningFlags;
+    candidate.rawDexscreenerSnapshot = enrichment.rawSnapshot;
+    candidate.flowMcapRatio = candidate.marketCap && candidate.flow24h !== null ? candidate.flow24h / candidate.marketCap : null;
+
+    if (candidate.liquidity !== null && candidate.liquidity < scoringConfig.alertRules.minLiquidityUsd && !candidate.riskFlags.includes("thin_liquidity")) {
+      candidate.riskFlags.push("thin_liquidity");
+    }
+
+    candidate.alertMomentumComponents = buildAlertMomentumComponents(candidate);
+    candidate.alertMomentumScore = clampScore(Object.values(candidate.alertMomentumComponents).reduce((sum, value) => sum + value, 0));
+    candidate.rankBucket = candidate.alertMomentumScore >= 85 ? "top" : candidate.alertMomentumScore >= 75 ? "strong" : candidate.alertMomentumScore >= 60 ? "watch" : "low";
+    candidate.card = createAlertCardFromCandidate(candidate);
+  }
+}
+
+function mergeAlertCandidates(candidates: AlertV2Candidate[]): AlertV2Candidate[] {
+  const merged = new Map<string, AlertV2Candidate>();
+
+  for (const candidate of candidates) {
+    const existing = merged.get(candidate.tokenAddress);
+
+    if (!existing) {
+      merged.set(candidate.tokenAddress, candidate);
+      continue;
+    }
+
+    existing.candidateSources = Array.from(new Set([...existing.candidateSources, ...candidate.candidateSources]));
+    existing.positiveFlags.push("source_confirmation");
+    existing.alertMomentumScore = clampScore(existing.alertMomentumScore + 5);
+    existing.card.edgeScore = existing.alertMomentumScore;
+    existing.card.status = getStatus(existing.alertMomentumScore);
+  }
+
+  return Array.from(merged.values());
+}
+
+async function buildAlertV2CandidatesFromSources(alertRunId: string): Promise<{
+  candidates: AlertV2Candidate[];
+  nansenCount: number;
+  freshCount: number;
+  watchCount: number;
+}> {
+  const { rows } = await fetchNansenAlertLightRows();
+  const rules = scoringConfig.alertRules;
+  const nowIso = new Date().toISOString();
+  const nansen = rows.slice(0, rules.nansenCandidateSize).map((row, index) => {
+    const marketCap = toFiniteNumber(row.market_cap_usd);
+    const flow24h = toFiniteNumber(row.net_flow_24h_usd);
+
+    return buildAlertV2Candidate({
+      alertRunId,
+      tokenAddress: toDisplayText(row.token_address, "UNKNOWN"),
+      symbol: toDisplayText(row.token_symbol, "UNKNOWN"),
+      name: toDisplayText(row.token_name ?? row.name, toDisplayText(row.token_symbol, "UNKNOWN")),
+      sourceType: "nansen_new",
+      sourceDetectedAt: nowIso,
+      marketCap,
+      price: toFiniteNumber(row.price_usd ?? row.token_price_usd),
+      ageDays: toFiniteNumber(row.token_age_days),
+      liquidity: getFirstNumberFromRecords(row, [/liquidity/]),
+      flow24h,
+      flow7d: toFiniteNumber(row.net_flow_7d_usd),
+      traderCount: toFiniteNumber(row.trader_count),
+      candidateRank: index + 1,
+    });
+  });
+  const freshRows = getRecentFreshScanCandidatesForAlert.all(
+    getRecentCutoffIso(rules.freshScanLookbackHours),
+    rules.freshScanDbCandidateSize,
+  ) as Array<Record<string, unknown>>;
+  const fresh: AlertV2Candidate[] = [];
+
+  for (const [index, row] of freshRows.entries()) {
+    const tokenAddress = toDisplayText(row.token_address, "UNKNOWN");
+    const market = await fetchDexScreenerMarketData(tokenAddress);
+    const sourceMcap = toFiniteNumber(row.mcap);
+    const sourceFlow = toFiniteNumber(row.flow_24h);
+    const marketCap = market?.marketCap ?? sourceMcap;
+    const flow24h = sourceFlow;
+
+    fresh.push(buildAlertV2Candidate({
+      alertRunId,
+      tokenAddress,
+      symbol: toOptionalText(row.symbol) ?? "UNKNOWN",
+      name: toOptionalText(row.name) ?? toOptionalText(row.symbol) ?? "UNKNOWN",
+      sourceType: "fresh_scan_reaccelerated",
+      sourceDetectedAt: toOptionalText(row.created_at) ?? nowIso,
+      marketCap,
+      price: market?.price ?? null,
+      ageDays: toFiniteNumber(row.age_days),
+      liquidity: market?.liquidity ?? toFiniteNumber(row.liquidity),
+      flow24h,
+      flow7d: toFiniteNumber(row.flow_7d),
+      traderCount: toFiniteNumber(row.traders),
+      sourceMarketCap: sourceMcap,
+      sourceFlow24h: sourceFlow,
+      sourceTraders: toFiniteNumber(row.traders),
+      fromFreshScanId: toOptionalText(row.scan_id),
+      fromScanCandidateId: toOptionalText(row.id),
+      rawDexscreenerSnapshot: market?.raw ?? null,
+      candidateRank: nansen.length + index + 1,
+    }));
+  }
+
+  const watchRows = getRecentWatchCandidatesForAlert.all(
+    getRecentCutoffIso(rules.watchCandidateLookbackHours),
+    rules.watchCandidateSize,
+  ) as Array<Record<string, unknown>>;
+  const watch: AlertV2Candidate[] = [];
+
+  for (const [index, row] of watchRows.entries()) {
+    const tokenAddress = toDisplayText(row.token_address, "UNKNOWN");
+    const market = await fetchDexScreenerMarketData(tokenAddress);
+    const sourceMcap = toFiniteNumber(row.scan_mcap);
+    const sourceFlow = toFiniteNumber(row.flow_24h);
+    const marketCap = market?.marketCap ?? sourceMcap;
+
+    watch.push(buildAlertV2Candidate({
+      alertRunId,
+      tokenAddress,
+      symbol: toOptionalText(row.symbol) ?? "UNKNOWN",
+      name: toOptionalText(row.name) ?? toOptionalText(row.symbol) ?? "UNKNOWN",
+      sourceType: toOptionalText(row.action) === "watch" ? "watch_reaccelerated" : "cli_near_miss_recheck",
+      sourceDetectedAt: toOptionalText(row.clicked_at) ?? nowIso,
+      marketCap,
+      price: market?.price ?? toFiniteNumber(row.scan_price),
+      ageDays: parseTokenAgeDays(toOptionalText(row.token_age)),
+      liquidity: market?.liquidity ?? null,
+      flow24h: sourceFlow,
+      flow7d: toFiniteNumber(row.flow_7d),
+      traderCount: toFiniteNumber(row.trader_count),
+      sourceMarketCap: sourceMcap,
+      sourceFlow24h: sourceFlow,
+      sourceTraders: toFiniteNumber(row.trader_count),
+      fromWatchPickId: toOptionalText(row.pick_id),
+      rawDexscreenerSnapshot: market?.raw ?? null,
+      candidateRank: nansen.length + fresh.length + index + 1,
+    }));
+  }
+
+  const merged = mergeAlertCandidates([...nansen, ...fresh, ...watch])
+    .sort((a, b) => b.alertMomentumScore - a.alertMomentumScore)
+    .slice(0, rules.candidatePoolSize);
+
+  merged.forEach((candidate, index) => {
+    candidate.candidateRank = index + 1;
+  });
+
+  return {
+    candidates: merged,
+    nansenCount: nansen.length,
+    freshCount: fresh.length,
+    watchCount: watch.length,
+  };
+}
+
+function applyAlertPreFilter(candidates: AlertV2Candidate[]): AlertV2Candidate[] {
+  const rules = scoringConfig.alertRules;
+  const gatePassed = candidates
+    .filter((candidate) => candidate.gate0Status === "pass")
+    .sort((a, b) => {
+      const sourceDiff = (a.candidateSourceType === "nansen_new" ? 1 : 0) - (b.candidateSourceType === "nansen_new" ? 1 : 0);
+
+      if (sourceDiff !== 0) return -sourceDiff;
+      return b.alertMomentumScore - a.alertMomentumScore;
+    });
+  const selected: AlertV2Candidate[] = [];
+  let freshCount = 0;
+  let watchCount = 0;
+
+  for (const candidate of gatePassed) {
+    const isFresh = candidate.candidateSourceType === "fresh_scan_reaccelerated";
+    const isWatch = candidate.candidateSourceType === "watch_reaccelerated" || candidate.candidateSourceType === "cli_near_miss_recheck";
+
+    if (selected.length >= rules.preFilterSize) break;
+    if (isFresh && freshCount >= rules.maxFreshScanDbCandidatesInPreFilter) continue;
+    if (isWatch && watchCount >= rules.maxWatchCandidatesInPreFilter) continue;
+
+    selected.push(candidate);
+    if (isFresh) freshCount += 1;
+    if (isWatch) watchCount += 1;
+  }
+
+  selected.forEach((candidate, index) => {
+    candidate.preFilterStatus = "pass";
+    candidate.preFilterRank = index + 1;
+    candidate.preFilterReason = `Alert Momentum ${candidate.alertMomentumScore}/100 / ${sourceTypeLabel(candidate.candidateSourceType)}`;
+    candidate.passReasonCodes.push("alert_pre_filter_pass");
+  });
+
+  return selected;
+}
+
 function buildDeepCheckAlertSummary(deepCheck: DeepCheckReply): string {
   return [
     `Flow Quality: ${deepCheck.flowQuality.label}`,
@@ -2466,14 +5096,13 @@ function buildDeepCheckAlertSummary(deepCheck: DeepCheckReply): string {
     `Sell Pressure: ${deepCheck.sellPressure.label}`,
     `Wallet Quality: ${deepCheck.walletQuality.walletQualityLevel}`,
     `Cluster Risk: ${deepCheck.clusterRisk.label}`,
-    `Confidence: ${deepCheck.confidence}`,
   ].join("\n");
 }
 
 function buildQualityGateSummary(gate: AlertQualityGateResult): string {
   const label = gate.passed ? "通過" : "除外";
-  const reasonText = gate.reasons.slice(0, 2).join(" / ") || "Quality Gate判定を記録しました。";
-  const warningText = gate.warnings.length > 0 ? `\n注意: ${gate.warnings.slice(0, 2).join(" / ")}` : "";
+  const reasonText = gate.reasons.slice(0, 2).join("｜") || "Quality Gate判定を記録しました。";
+  const warningText = gate.warnings.length > 0 ? `\n注意: ${gate.warnings.slice(0, 2).join("｜")}` : "";
 
   return `${label} - ${reasonText}${warningText}`;
 }
@@ -2483,30 +5112,50 @@ function buildAlertEmbed(
   index: number,
   deepCheck?: DeepCheckReply,
   gate?: AlertQualityGateResult,
+  candidate?: AlertV2Candidate,
 ): InstanceType<typeof EmbedBuilder> {
   const relatedLinks = [
     `[DexScreener](${card.dexscreenerUrl})`,
     `[GMGN](${card.gmgnUrl})`,
     `[UniversalX](${card.universalxUrl})`,
-  ].join(" | ");
-  const alertReason = getAlertReasonLines(card).map((reason) => `• ${reason}`).join("\n");
-  const reFlowText = card.isReFlow
-    ? "\n\n**🔁 Re-Flow:** 古い銘柄に再びSmart Money flowが入った候補です。"
-    : "";
+  ].join("｜");
+  const qualityPassed = gate?.passed ? "✅ Passed" : "❌ Rejected";
+  const cliGrade = candidate?.cliGrade ?? "Unchecked";
+  const source = candidate ? sourceTypeLabel(candidate.candidateSourceType) : "Nansen New";
+  const riskLabels = getAlertCardRiskLabels(card, deepCheck, gate, candidate);
+  const detectionReasons = [
+    `• Alert条件を通過\n  MCap ${formatCompactUsd(card.marketCap)} / Flow-MCap ${formatPercent(card.flowMcapRatio)}。小型に対して強いSmart Money flowです。`,
+    deepCheck ? `• 買い優勢\n  Buyer/Sellerは${deepCheck.buyerSellerBalance.label}。直近の買いと売りのバランスを確認済みです。` : null,
+    deepCheck ? `• リスク確認\n  Holder Risk / Sell Pressure / Cluster Risk はHighではありません。` : null,
+    candidate?.isReaccelerated ? `• 再加速\n  ${candidate.reaccelerationReason ?? "source検出時より条件が改善しています。"}` : null,
+  ].filter(Boolean).slice(0, 4).join("\n\n");
   const description = [
-    `**Score:** ${card.edgeScore}/100 ${card.status}`,
-    `**Signal:** ${card.signalType}`,
-    `**MCap:** ${formatCompactUsd(card.marketCap)}`,
+    "**判定**",
+    ...formatTreeRows([
+      ["Score", `${card.edgeScore}/100 ${card.status}`],
+      ["Signal", formatSignalTypeLabel(card.signalType)],
+      ["Risk", formatDisplayRiskLine(riskLabels)],
+      ["Quality Gate", qualityPassed],
+      ["CLI Grade", cliGrade],
+      ["Source", source],
+    ]),
+    "",
+    "**Stats**",
+    ...formatTreeRows([
+      ["MCap", formatCompactUsd(card.marketCap)],
+      ["Age", card.tokenAge],
+      ["Flow/MCap", formatPercent(card.flowMcapRatio)],
+      ["24h Flow", formatCompactUsd(card.flow24h)],
+      ["Traders", `${formatCount(card.traderCount)}人`],
+    ]),
+    "",
     `**CA:** \`${card.tokenAddress}\``,
+    `**検出理由:**\n${detectionReasons}`,
     `**関連リンク:**\n${relatedLinks}`,
-    `**ナラティブ:** ${card.narrative}${reFlowText}`,
-    `**Alert理由:**\n${alertReason}`,
-    deepCheck ? `**Deep Check:**\n${buildDeepCheckAlertSummary(deepCheck)}` : null,
-    gate ? `**Quality Gate:**\n${buildQualityGateSummary(gate)}` : null,
-  ].join("\n\n");
+  ].join("\n");
 
   const embed = new EmbedBuilder()
-    .setTitle(`#${index + 1} ${card.symbol} / ${card.name}`)
+    .setTitle(`#${index + 1} ${cleanDisplaySymbol(card.symbol)} / ${card.name}`)
     .setColor(0xe74c3c)
     .setDescription(description)
     .setTimestamp(new Date(card.scanTime));
@@ -2523,14 +5172,19 @@ function saveAlert(
   channelId: string | null,
   gate?: AlertQualityGateResult,
   deepCheckId?: string | null,
-): void {
+  candidate?: AlertV2Candidate,
+  messageId?: string | null,
+): string {
+  const alertId = randomUUID();
+  const createdAt = new Date().toISOString();
+
   insertAlert.run(
-    randomUUID(),
+    alertId,
     card.tokenAddress,
     card.signalId,
-    getAlertType(card),
+    getAlertType(),
     card.edgeScore,
-    new Date().toISOString(),
+    createdAt,
     channelId,
     getAlertReasonLines(card).join(" / "),
     gate?.grade ?? null,
@@ -2538,6 +5192,30 @@ function saveAlert(
     gate?.warnings.join(" / ") ?? null,
     deepCheckId ?? null,
   );
+
+  if (candidate) {
+    updateAlertV2Details.run(
+      candidate.alertRunId,
+      messageId ?? null,
+      candidate.marketCap,
+      candidate.ageDays,
+      candidate.liquidity,
+      candidate.flow1h,
+      candidate.flow4h,
+      candidate.flow24h,
+      candidate.flowMcapRatio,
+      candidate.traderCount,
+      candidate.alertMomentumScore,
+      candidate.cliGrade,
+      candidate.candidateSourceType,
+      candidate.isRealert ? 1 : 0,
+      candidate.realertReason,
+      createdAt,
+      alertId,
+    );
+  }
+
+  return alertId;
 }
 
 function normalizeTokenAddress(value: string): string {
@@ -3449,7 +6127,7 @@ function buildDeepCheckFinalNote(
   confidence: DeepCheckConfidence,
 ): string {
   if (confidence === "Low") {
-    return "取得できたNansenデータが少ないため、confidenceは低めです。Fresh ScanやAlertの補助情報として慎重に扱ってください。";
+    return "Fresh ScanやAlertの補助情報として、Flow Quality、Holder Risk、Buyer/Seller Balanceの取れた項目を中心に見ます。追加データが入ればAlert判定を更新します。";
   }
 
   if (clusterRisk.label === "High") {
@@ -3465,7 +6143,7 @@ function buildDeepCheckFinalNote(
     buyerSellerBalance.label === "Bullish" &&
     (holderQuality.label === "Low" || holderQuality.label === "Medium")
   ) {
-    return "Fresh Edgeとして見る価値はあります。Smart MoneyとFresh Walletの流入が確認されており、買い手優勢です。ただし、Holder Riskには注意してください。";
+    return "Flow Watchとして見る価値はあります。Smart MoneyとFresh Walletの流入が確認されており、買い手優勢です。ただし、Holder Riskには注意してください。";
   }
 
   return "一部のflowは確認できますが、方向感はまだ限定的です。Flow Quality、Holder Risk、Buyer/Seller Balanceを合わせて継続確認してください。";
@@ -3504,8 +6182,10 @@ function buildDeepCheckRawSummary(sources: DeepCheckSourceResult[]): string {
 
 async function buildDeepCheckReply(tokenAddress: string): Promise<DeepCheckReply> {
   const signal = getLatestSignalByToken.get(tokenAddress) as SignalRecord | undefined;
-  const profile = await fetchDexScreenerTokenProfile(tokenAddress);
-  const sources = await fetchDeepCheckSources(tokenAddress);
+  const [profile, sources] = await Promise.all([
+    fetchDexScreenerTokenProfile(tokenAddress),
+    fetchDeepCheckSources(tokenAddress),
+  ]);
   const flowSource = getSourceResult(sources, "flow-intelligence");
   const holderSource = getSourceResult(sources, "holders");
   const buyerSellerSource = getSourceResult(sources, "who-bought-sold");
@@ -3520,6 +6200,11 @@ async function buildDeepCheckReply(tokenAddress: string): Promise<DeepCheckReply
     text: walletQuality.clusterReasons.join(" "),
   };
   const confidence = getDeepCheckConfidence(sources, walletQuality);
+  const ageDays = parseTokenAgeDays(signal?.token_age ?? null);
+  const marketCap = profile.marketCap ?? signal?.scan_mcap ?? null;
+  const flow24h = signal?.flow_24h ?? null;
+  const flow7d = signal?.flow_7d ?? null;
+  const flowMcapRatio = signal?.flow_mcap_ratio ?? (marketCap && flow24h !== null ? flow24h / marketCap : null);
   const finalNote = buildDeepCheckFinalNote(
     flowQuality,
     holderQuality,
@@ -3532,8 +6217,8 @@ async function buildDeepCheckReply(tokenAddress: string): Promise<DeepCheckReply
   return {
     tokenAddress,
     symbol: signal?.symbol ?? profile.symbol,
-    name: profile.name,
-    marketCap: profile.marketCap ?? signal?.scan_mcap ?? null,
+    name: signal?.name ?? profile.name,
+    marketCap,
     signalId: signal?.signal_id ?? null,
     flowQuality,
     holderQuality,
@@ -3541,6 +6226,7 @@ async function buildDeepCheckReply(tokenAddress: string): Promise<DeepCheckReply
     sellPressure,
     clusterRisk,
     walletQuality,
+    narrative: createHiddenTokenNarrative(),
     finalNote,
     confidence,
     rawSummary: buildDeepCheckRawSummary(sources),
@@ -3562,6 +6248,12 @@ function saveDeepCheckResult(result: DeepCheckReply, signalIdOverride?: string |
     result.clusterRisk.label,
     result.finalNote,
     result.rawSummary,
+    result.narrative.narrativeSummary,
+    result.narrative.narrativeType,
+    JSON.stringify(result.narrative.narrativeSources),
+    JSON.stringify(result.narrative.narrativeEvidence),
+    JSON.stringify(result.narrative.narrativeTags),
+    result.narrative.internalConfidence,
     result.walletQuality.walletQualitySummary,
     JSON.stringify(result.walletQuality.behaviorCounts),
     result.walletQuality.estimatedIndependentWallets,
@@ -3594,11 +6286,11 @@ function buildDeepCheckEmbed(result: DeepCheckReply): InstanceType<typeof EmbedB
     `[DexScreener](https://dexscreener.com/solana/${result.tokenAddress})`,
     `[GMGN](https://gmgn.ai/sol/token/${result.tokenAddress})`,
     `[UniversalX](https://universalx.app/trade?assetId=101_${result.tokenAddress})`,
-  ].join(" | ");
+  ].join("｜");
   const displayName = [
-    result.symbol ? `$${result.symbol}` : "$UNKNOWN",
+    result.symbol ? formatDisplaySymbol(result.symbol) : "$UNKNOWN",
     result.name,
-  ].filter(Boolean).join(" / ");
+  ].filter(Boolean).join("｜");
 
   return new EmbedBuilder()
     .setTitle("🔎 Meme Deep Check")
@@ -3640,6 +6332,16 @@ function evaluateAlertQualityGate(
   if (candidate.marketCap === null || candidate.marketCap > scoringConfig.alertRules.maxMcap) {
     reasons.push(`MCap ${formatCompactUsd(scoringConfig.alertRules.maxMcap)}超え`);
   }
+  if (candidate.marketCap !== null && candidate.marketCap < scoringConfig.alertRules.minMcap) {
+    reasons.push("MCap下限未満");
+  }
+  const candidateLiquidity = "liquidity" in candidate ? (candidate as MemeResearchCard & { liquidity?: number | null }).liquidity ?? null : null;
+  if (candidateLiquidity !== null && candidateLiquidity < scoringConfig.alertRules.minLiquidityUsd) {
+    reasons.push("Liquidity不足");
+  }
+  if ((candidate.traderCount ?? 0) < scoringConfig.alertRules.minTraders) {
+    reasons.push("Traders不足");
+  }
 
   if (gateConfig.rejectHolderRisk.includes(deepCheck.holderQuality.label)) {
     reasons.push("Holder Risk High");
@@ -3662,6 +6364,18 @@ function evaluateAlertQualityGate(
   const microArbCount = behaviorCounts["Micro-arb"];
   const mirrorLikeCount = behaviorCounts["Mirror-like"];
   const constructiveCount = behaviorCounts["Fresh Sniper"] + behaviorCounts.Accumulator;
+
+  if (
+    scoringConfig.alertRules.requireDexTradesCheck &&
+    !options.allowMockFallback &&
+    (walletQuality.walletCount === 0 || deepCheck.clusterRisk.label === "未検証")
+  ) {
+    reasons.push("dex-trades未検証");
+  }
+
+  if (walletQuality.walletCount > 0 && constructiveCount <= 1 && (candidate.traderCount ?? 0) <= 3) {
+    reasons.push("Whale 1人だけの小型買い");
+  }
 
   if (walletQuality.walletCount > 0 && microArbCount > constructiveCount && microArbCount >= 2) {
     reasons.push("Micro-arb wallet偏重");
@@ -3836,6 +6550,25 @@ function buildMemeScanReplies(
   return replies;
 }
 
+function buildFreshScanDataCollectionReply(result: {
+  candidateCount: number;
+  gate0PassCount: number;
+  momentumGatePassCount: number;
+  preFilterPassCount: number;
+}): MemeScanReply {
+  return {
+    content: [
+      "Fresh Scan完了。",
+      `候補${result.candidateCount}件を保存しました。`,
+      `Gate 0通過: ${result.gate0PassCount}件`,
+      `Momentum Gate通過: ${result.momentumGatePassCount}件`,
+      `Pre-filter通過: ${result.preFilterPassCount}件`,
+      "投稿: OFF",
+      "通知はAlertで行います。",
+    ].join("\n"),
+  };
+}
+
 async function readMockNetflowRows(): Promise<NetflowRow[]> {
   let rawJson: string;
 
@@ -3856,22 +6589,40 @@ async function readMockNetflowRows(): Promise<NetflowRow[]> {
   return findNetflowRows(json);
 }
 
-async function readLiveNetflowRows(): Promise<NetflowRow[]> {
+async function readLiveNetflowRows(requestedCandidatePoolSize: number): Promise<{ rows: NetflowRow[]; metadata: NansenFetchMetadata }> {
+  const limit = Math.min(requestedCandidatePoolSize, NANSEN_NETFLOW_PAGE_LIMIT);
+  const warning = requestedCandidatePoolSize > NANSEN_NETFLOW_PAGE_LIMIT
+    ? `Nansenの1回取得上限${NANSEN_NETFLOW_PAGE_LIMIT}を超えたため、limitを${NANSEN_NETFLOW_PAGE_LIMIT}にclampして取得しました。CLIでpagination指定を確認できないため、取得できた件数でFresh Scanを続行します。`
+    : null;
+
   // shellを使わず引数を配列で渡すと、コマンドの実行内容が分かりやすく安全です。
   const { stdout } = await execFileAsync(
     "nansen",
-    ["research", "smart-money", "netflow", "--chain", "solana", "--limit", "20"],
+    ["research", "smart-money", "netflow", "--chain", "solana", "--limit", String(limit)],
     { timeout: 30_000, maxBuffer: 1024 * 1024 },
   );
 
   const json = JSON.parse(stdout);
+  const rows = dedupeNetflowRowsByTokenAddress(findNetflowRows(json)).slice(0, requestedCandidatePoolSize);
 
-  return findNetflowRows(json);
+  return {
+    rows,
+    metadata: {
+      requestedCandidatePoolSize,
+      actualCandidatePoolSize: rows.length,
+      nansenPageLimit: limit,
+      nansenPaginationUsed: false,
+      nansenFetchWarning: warning ?? (rows.length < requestedCandidatePoolSize
+        ? `requested_candidate_pool_size=${requestedCandidatePoolSize}に対してactual_candidate_pool_size=${rows.length}件でFresh Scanを続行しました。`
+        : null),
+    },
+  };
 }
 
-async function fetchNansenNetflowRows(): Promise<{ rows: NetflowRow[]; source: NansenDataSource }> {
+async function fetchNansenNetflowRows(): Promise<{ rows: NetflowRow[]; source: NansenDataSource; metadata: NansenFetchMetadata }> {
   const now = Date.now();
   const mode: NansenFetchMode = process.env.USE_MOCK_NANSEN === "true" ? "mock" : "live";
+  const requestedCandidatePoolSize = scoringConfig.freshScanRules.candidatePoolSize;
 
   // 5分以内ならmock/liveそれぞれの前回結果を使います。
   if (
@@ -3879,18 +6630,64 @@ async function fetchNansenNetflowRows(): Promise<{ rows: NetflowRow[]; source: N
     cachedNansenResult.mode === mode &&
     cachedNansenResult.expiresAt > now
   ) {
-    return { rows: cachedNansenResult.rows, source: "cache" };
+    return { rows: cachedNansenResult.rows, source: "cache", metadata: cachedNansenResult.metadata };
   }
 
-  const rows = mode === "mock" ? await readMockNetflowRows() : await readLiveNetflowRows();
+  const rowsWithMetadata = mode === "mock"
+    ? await (async (): Promise<{ rows: NetflowRow[]; metadata: NansenFetchMetadata }> => {
+        const rows = dedupeNetflowRowsByTokenAddress(await readMockNetflowRows()).slice(0, requestedCandidatePoolSize);
+
+        return {
+          rows,
+          metadata: {
+            requestedCandidatePoolSize,
+            actualCandidatePoolSize: rows.length,
+            nansenPageLimit: Math.min(requestedCandidatePoolSize, NANSEN_NETFLOW_PAGE_LIMIT),
+            nansenPaginationUsed: false,
+            nansenFetchWarning: rows.length < requestedCandidatePoolSize
+              ? `mockデータがrequested_candidate_pool_size=${requestedCandidatePoolSize}未満の${rows.length}件だったため、取得できた件数でFresh Scanを続行しました。`
+              : null,
+          },
+        };
+      })()
+    : await readLiveNetflowRows(requestedCandidatePoolSize);
 
   cachedNansenResult = {
-    rows,
+    rows: rowsWithMetadata.rows,
+    metadata: rowsWithMetadata.metadata,
     mode,
     expiresAt: now + NANSEN_CACHE_TTL_MS,
   };
 
-  return { rows, source: mode };
+  return { rows: rowsWithMetadata.rows, source: mode, metadata: rowsWithMetadata.metadata };
+}
+
+async function fetchNansenAlertLightRows(): Promise<{ rows: NetflowRow[]; source: NansenDataSource }> {
+  const mode: NansenFetchMode = process.env.USE_MOCK_NANSEN === "true" ? "mock" : "live";
+
+  if (mode === "mock") {
+    const rows = await readMockNetflowRows();
+
+    return { rows: rows.slice(0, scoringConfig.alertRules.nansenCandidateSize), source: "mock" };
+  }
+
+  try {
+    const { stdout } = await execFileAsync(
+      "nansen",
+      ["research", "smart-money", "netflow", "--chain", "solana", "--limit", String(scoringConfig.alertRules.nansenCandidateSize)],
+      { timeout: 30_000, maxBuffer: 1024 * 1024 },
+    );
+    const json = JSON.parse(stdout);
+
+    return { rows: findNetflowRows(json), source: "live" };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "不明なエラー";
+
+    console.warn(`[Alert v2] Nansen light scanに失敗したため通常cacheへfallbackします: ${message}`);
+    const fallback = await fetchNansenNetflowRows();
+
+    return { rows: fallback.rows.slice(0, scoringConfig.alertRules.nansenCandidateSize), source: fallback.source };
+  }
 }
 
 async function getDeskTestMessage(): Promise<string> {
@@ -3899,9 +6696,51 @@ async function getDeskTestMessage(): Promise<string> {
   return formatDeskTestMessage(rows);
 }
 
-async function getMemeScanResult(label: MemeScanLabel): Promise<MemeScanResult> {
-  const { rows, source } = await fetchNansenNetflowRows();
-  const cards = getFreshScanCards(await buildMemeResearchCards(rows));
+async function getMemeScanResult(label: MemeScanLabel, options: { postTopSignals?: boolean } = {}): Promise<MemeScanResult> {
+  const { rows, source, metadata } = await fetchNansenNetflowRows();
+  const freshScan = await buildFreshScanV2(rows, source, label, metadata);
+  scheduleFreshCandidateTracking(freshScan.candidates);
+  const summary = {
+    candidateCount: freshScan.candidates.length,
+    gate0PassCount: freshScan.candidates.filter((candidate) => candidate.gate0Status === "pass").length,
+    momentumGatePassCount: freshScan.candidates.filter((candidate) => candidate.momentumGateStatus === "pass").length,
+    preFilterPassCount: freshScan.candidates.filter((candidate) => candidate.preFilterStatus === "pass").length,
+  };
+  const postTopSignals = options.postTopSignals ?? scoringConfig.freshScanRules.postTopSignals;
+
+  if (!postTopSignals) {
+    return {
+      replies: [buildFreshScanDataCollectionReply(summary)],
+      scanId: freshScan.scanId,
+      scanTime: freshScan.scanTime,
+      source,
+      signalIds: [],
+      postTopSignals,
+      ...summary,
+    };
+  }
+
+  const cards = await buildMemeResearchCards(freshScan.selectedRows);
+
+  for (const card of cards) {
+    const candidate = freshScan.candidates.find((item) => item.tokenAddress === card.tokenAddress);
+
+    if (!candidate) continue;
+
+    card.scanId = freshScan.scanId;
+    card.scanTime = freshScan.scanTime;
+    card.edgeScore = candidate.score;
+    card.status = getStatus(candidate.score);
+    card.signalType = candidate.signalType;
+    card.whyFlagged = buildDetectionReasons({
+      marketCap: card.marketCap,
+      flow24h: card.flow24h,
+      flowMcapRatio: card.flowMcapRatio,
+      traderCount: card.traderCount,
+      ageDays: card.ageDays,
+      cliGrade: candidate.cliGrade,
+    });
+  }
 
   saveMemeSignals(cards);
 
@@ -3909,10 +6748,12 @@ async function getMemeScanResult(label: MemeScanLabel): Promise<MemeScanResult> 
 
   return {
     replies: buildMemeScanReplies(cards, label),
-    scanId: firstCard?.scanId ?? randomUUID(),
-    scanTime: firstCard?.scanTime ?? new Date().toISOString(),
+    scanId: firstCard?.scanId ?? freshScan.scanId,
+    scanTime: firstCard?.scanTime ?? freshScan.scanTime,
     source,
     signalIds: cards.map((card) => card.signalId),
+    postTopSignals,
+    ...summary,
   };
 }
 
@@ -3925,7 +6766,7 @@ async function getMemeAlertCards(): Promise<{ cards: MemeResearchCard[]; source:
     .filter((card) => !hasRecentAlert(card.tokenAddress, cutoffIso))
     .map((card) => ({
       ...card,
-      signalType: card.isReFlow ? "🔁 Re-Flow" as SignalType : "🚨 Alert Edge" as SignalType,
+      signalType: "alert_edge" as SignalType,
     }))
     .sort((a, b) => {
       const alertTypeDiff = Number(a.isReFlow) - Number(b.isReFlow);
@@ -3947,6 +6788,80 @@ async function getMemeAlertCards(): Promise<{ cards: MemeResearchCard[]; source:
   return { cards: candidates, source };
 }
 
+function serializeAlertCandidate(candidate: AlertV2Candidate): Parameters<typeof sqliteAlertStore.saveRun>[1][number] {
+  return {
+    alert_run_id: candidate.alertRunId,
+    token_address: candidate.tokenAddress,
+    symbol: candidate.symbol,
+    name: candidate.name,
+    candidate_rank: candidate.candidateRank,
+    candidate_source_type: candidate.candidateSourceType,
+    candidate_sources: JSON.stringify(candidate.candidateSources),
+    source_quota_bucket: candidate.sourceQuotaBucket,
+    source_priority: candidate.sourcePriority,
+    source_detected_at: candidate.sourceDetectedAt,
+    candidate_freshness_minutes: candidate.candidateFreshnessMinutes,
+    market_data_refreshed_at: candidate.marketDataRefreshedAt,
+    market_data_age_minutes: candidate.marketDataAgeMinutes,
+    market_data_source: candidate.marketDataSource,
+    market_data_warning: candidate.marketDataWarning,
+    from_fresh_scan_id: candidate.fromFreshScanId,
+    from_scan_candidate_id: candidate.fromScanCandidateId,
+    from_previous_alert_run_id: candidate.fromPreviousAlertRunId,
+    from_watch_pick_id: candidate.fromWatchPickId,
+    is_reaccelerated: candidate.isReaccelerated ? 1 : 0,
+    reacceleration_reason: candidate.reaccelerationReason,
+    mcap: candidate.marketCap,
+    price: candidate.price,
+    age_days: candidate.ageDays,
+    liquidity: candidate.liquidity,
+    volume_24h: candidate.volume24h,
+    flow_1h: candidate.flow1h,
+    flow_4h: candidate.flow4h,
+    flow_24h: candidate.flow24h,
+    flow_7d: candidate.flow7d,
+    flow_mcap: candidate.flowMcapRatio,
+    traders: candidate.traderCount,
+    gate_0_status: candidate.gate0Status,
+    gate_0_reason: candidate.gate0Reason,
+    alert_momentum_score: candidate.alertMomentumScore,
+    alert_momentum_components: JSON.stringify(candidate.alertMomentumComponents),
+    pre_filter_status: candidate.preFilterStatus,
+    pre_filter_rank: candidate.preFilterRank,
+    pre_filter_reason: candidate.preFilterReason,
+    cli_checked: candidate.cliChecked ? 1 : 0,
+    cli_grade: candidate.cliGrade,
+    cli_oracle_status: candidate.cliOracleStatus,
+    raw_cli_summary: candidate.rawCliSummary,
+    raw_nansen_flow_intelligence: null,
+    raw_nansen_who_bought_sold: null,
+    raw_nansen_holders: null,
+    raw_nansen_dex_trades: null,
+    flow_quality: candidate.flowQuality,
+    holder_risk: candidate.holderRisk,
+    buyer_seller_balance: candidate.buyerSellerBalance,
+    sell_pressure: candidate.sellPressure,
+    wallet_quality: candidate.walletQuality,
+    cluster_risk: candidate.clusterRisk,
+    quality_gate_grade: candidate.qualityGateGrade,
+    quality_gate_reasons: JSON.stringify(candidate.qualityGateReasons),
+    quality_gate_warnings: JSON.stringify(candidate.qualityGateWarnings),
+    positive_flags: JSON.stringify(candidate.positiveFlags),
+    risk_flags: JSON.stringify(candidate.riskFlags),
+    warning_flags: JSON.stringify(candidate.warningFlags),
+    pass_reason_codes: JSON.stringify(candidate.passReasonCodes),
+    reject_reason_codes: JSON.stringify(candidate.rejectReasonCodes),
+    rank_bucket: candidate.rankBucket,
+    final_rank: candidate.finalRank,
+    posted: candidate.posted ? 1 : 0,
+    posted_message_id: candidate.postedMessageId,
+    entry_mcap: candidate.entryMcap,
+    entry_price: candidate.entryPrice,
+    raw_dexscreener_snapshot: JSON.stringify(candidate.rawDexscreenerSnapshot ?? null),
+    created_at: candidate.createdAt,
+  };
+}
+
 async function runAlertCheck(
   channel: SendableChannel,
   options: AlertCheckOptions,
@@ -3955,14 +6870,28 @@ async function runAlertCheck(
     throw new Error("投稿先チャンネルIDを取得できませんでした。");
   }
 
-  const { cards } = await getMemeAlertCards();
+  const alertRunId = randomUUID();
+  const startedAt = new Date().toISOString();
+  const sourceBuild = await buildAlertV2CandidatesFromSources(alertRunId);
+  const candidates = sourceBuild.candidates;
+  const seen = new Set<string>();
+
+  await enrichAlertCandidatesBeforeGate(candidates);
+
+  for (const candidate of candidates) {
+    applyAlertGate0(candidate, seen);
+  }
+
+  const preFiltered = applyAlertPreFilter(candidates);
+  const cliTargets = preFiltered.slice(0, scoringConfig.alertRules.cliOracleCheckSize);
+  let alertUsedCredits = 0;
   const result: AlertCheckResult = {
-    checkedCount: cards.length,
+    checkedCount: candidates.length,
     posted: [],
     rejected: [],
   };
 
-  if (cards.length === 0) {
+  if (candidates.length === 0) {
     return result;
   }
 
@@ -3971,17 +6900,40 @@ async function runAlertCheck(
     deepCheck: DeepCheckReply;
     gate: AlertQualityGateResult;
     deepCheckId: string;
+    candidate: AlertV2Candidate;
   }> = [];
 
-  for (const card of cards) {
+  for (const candidate of cliTargets) {
+    const card = candidate.card;
+
     try {
-      const deepCheck = await buildDeepCheckReply(card.tokenAddress);
+      const tracking = await withNansenCreditTracking(`alert-v2-cli-oracle:${card.tokenAddress}`, () => buildDeepCheckReply(card.tokenAddress));
+      const deepCheck = tracking.result;
+      alertUsedCredits += tracking.usedCredits ?? 0;
       const gate = evaluateAlertQualityGate(deepCheck, card, {
         allowMockFallback: options.allowMockFallback,
       });
+      const cliGate = gradeCliQuality(deepCheck);
+
+      candidate.cliChecked = true;
+      candidate.cliGrade = cliGate.grade;
+      candidate.cliOracleStatus = cliGate.status;
+      candidate.rawCliSummary = deepCheck.rawSummary;
+      candidate.flowQuality = deepCheck.flowQuality.label;
+      candidate.holderRisk = deepCheck.holderQuality.label;
+      candidate.buyerSellerBalance = deepCheck.buyerSellerBalance.label;
+      candidate.sellPressure = deepCheck.sellPressure.label;
+      candidate.walletQuality = deepCheck.walletQuality.walletQualityLevel;
+      candidate.clusterRisk = deepCheck.clusterRisk.label;
+      candidate.qualityGateGrade = gate.grade;
+      candidate.qualityGateReasons = gate.reasons;
+      candidate.qualityGateWarnings = gate.warnings;
+      candidate.deepCheck = deepCheck;
+      candidate.gate = gate;
 
       if (!gate.passed) {
         saveDeepCheckResult(deepCheck);
+        candidate.rejectReasonCodes.push(...gate.reasons.map((reason) => reason.toLowerCase().replace(/[^a-z0-9]+/g, "_")).filter(Boolean));
         result.rejected.push({ card, deepCheck, gate });
         console.log(`Rejected Meme Edge Alert: ${card.symbol} ${gate.reasons.join(" / ")}`);
         continue;
@@ -3989,7 +6941,8 @@ async function runAlertCheck(
 
       const deepCheckId = saveDeepCheckResult(deepCheck, card.signalId);
 
-      passedCards.push({ card, deepCheck, gate, deepCheckId });
+      candidate.passReasonCodes.push("alert_quality_gate_pass");
+      passedCards.push({ card, deepCheck, gate, deepCheckId, candidate });
     } catch (error) {
       const message = error instanceof Error ? error.message : "不明なエラー";
       const fallbackDeepCheck: DeepCheckReply = {
@@ -4013,6 +6966,7 @@ async function runAlertCheck(
           walletQualitySummary: "Wallet Quality: N/A",
           snapshots: [],
         },
+        narrative: createHiddenTokenNarrative(),
         finalNote: "Deep Checkの取得に失敗したため、Alert投稿は見送りました。",
         confidence: "Low",
         rawSummary: message,
@@ -4021,24 +6975,37 @@ async function runAlertCheck(
         allowMockFallback: options.allowMockFallback,
       });
 
+      candidate.cliChecked = true;
+      candidate.cliGrade = "C";
+      candidate.cliOracleStatus = `failed: ${message}`;
+      candidate.rawCliSummary = message;
+      candidate.qualityGateGrade = gate.grade;
+      candidate.qualityGateReasons = gate.reasons;
+      candidate.qualityGateWarnings = gate.warnings;
+      candidate.rejectReasonCodes.push("cli_oracle_failed");
       saveDeepCheckResult(fallbackDeepCheck);
       result.rejected.push({ card, deepCheck: fallbackDeepCheck, gate });
       console.warn(`Deep Check failed for alert candidate: ${card.symbol}`, error);
     }
   }
 
-  const selected = passedCards.slice(0, options.maxAlerts);
+  const selected = passedCards
+    .sort((a, b) => b.candidate.alertMomentumScore - a.candidate.alertMomentumScore)
+    .slice(0, options.maxAlerts);
 
-  if (selected.length === 0) {
-    return result;
+  selected.forEach((item, index) => {
+    item.candidate.finalRank = index + 1;
+    item.candidate.posted = true;
+  });
+
+  if (selected.length > 0) {
+    saveMemeSignals(selected.map((item) => item.card));
   }
 
-  saveMemeSignals(selected.map((item) => item.card));
-
   for (const [index, item] of selected.entries()) {
-    const { card, deepCheck, gate, deepCheckId } = item;
+    const { card, deepCheck, gate, deepCheckId, candidate } = item;
     const reply: MemeScanReply = {
-      embeds: [buildAlertEmbed(card, index, deepCheck, gate)],
+      embeds: [buildAlertEmbed(card, index, deepCheck, gate, candidate)],
       components: [buildPaperPickButtons(card.signalId)],
     };
 
@@ -4049,9 +7016,53 @@ async function runAlertCheck(
     const message = await channel.send(reply);
 
     saveSignalMessage(card.signalId, message);
-    saveAlert(card, channel.id, gate, deepCheckId);
-    result.posted.push({ card, deepCheck, gate });
+    candidate.postedMessageId = message.id;
+    saveAlert(card, channel.id, gate, deepCheckId, candidate, message.id);
+    result.posted.push({ card, deepCheck, gate, candidate });
   }
+
+  try {
+    await alertStore.saveRun(
+      {
+        alert_run_id: alertRunId,
+        started_at: startedAt,
+        finished_at: new Date().toISOString(),
+        candidate_pool_size: candidates.length,
+        nansen_candidate_size: sourceBuild.nansenCount,
+        fresh_scan_db_candidate_size: sourceBuild.freshCount,
+        watch_candidate_size: sourceBuild.watchCount,
+        pre_filter_size: preFiltered.length,
+        cli_oracle_check_size: cliTargets.length,
+        posted_count: selected.length,
+        used_credits: alertUsedCredits,
+        credits_by_step: JSON.stringify({
+          candidates_processed: candidates.length,
+          cli_checks_count: cliTargets.length,
+          posted_count: selected.length,
+          winners_count: null,
+          cli_oracle_used_credits: alertUsedCredits,
+          cost_per_posted_signal: selected.length > 0 ? alertUsedCredits / selected.length : null,
+          cost_per_winner: null,
+        }),
+        status: "completed",
+        error_message: null,
+        config_snapshot: JSON.stringify(scoringConfig.alertRules),
+        market_context: JSON.stringify({
+          nansen_candidate_size: sourceBuild.nansenCount,
+          fresh_scan_db_candidate_size: sourceBuild.freshCount,
+          watch_candidate_size: sourceBuild.watchCount,
+        }),
+        created_at: startedAt,
+      },
+      candidates.map(serializeAlertCandidate),
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "不明なエラー";
+
+    console.warn(`Alert v2候補保存に失敗しました (${alertStore.provider}): ${message}`);
+  }
+
+  scheduleAlertCandidateTracking(candidates, channel);
 
   return result;
 }
@@ -4236,7 +7247,23 @@ function getPerformancePeriodLabel(period: PerformancePeriod): string {
 }
 
 function getSymbolLabel(signal: ResultSignalRecord): string {
-  return signal.symbol ? `$${signal.symbol}` : shortenAddress(signal.token_address);
+  return signal.symbol ? formatDisplaySymbol(signal.symbol) : shortenAddress(signal.token_address);
+}
+
+function cleanDisplaySymbol(symbol: string | null | undefined): string {
+  const cleaned = String(symbol ?? "UNKNOWN")
+    .trim()
+    .replace(/^\$+/, "")
+    .replace(/^[\p{Emoji_Presentation}\p{Extended_Pictographic}\uFE0F\s]+/u, "")
+    .trim()
+    .replace(/^\$+/, "")
+    .trim();
+
+  return cleaned || "UNKNOWN";
+}
+
+function formatDisplaySymbol(symbol: string | null | undefined): string {
+  return `$${cleanDisplaySymbol(symbol)}`;
 }
 
 function getPeriodStartIso(period: Exclude<MemeResultsPeriod, "latest">): string {
@@ -4305,7 +7332,7 @@ async function formatBestUserPick(
 
   const userLabel = await resolveUserLabel(interaction, pick.userId);
 
-  return `${userLabel} | ${actionPlainLabel(pick.action)} | ${getSymbolLabel(pick.signal)} ${formatReturnX(pick.returnX)}`;
+  return `${userLabel}｜${actionPlainLabel(pick.action)}｜${getSymbolLabel(pick.signal)} ${formatReturnX(pick.returnX)}`;
 }
 
 function savePerformanceSnapshot(
@@ -4338,6 +7365,9 @@ async function buildSignalPerformance(
     ? {
       marketCap: latestSnapshot.current_mcap,
       price: latestSnapshot.current_price,
+      liquidity: null,
+      volume24h: null,
+      pairUrl: null,
     }
     : await fetchDexScreenerMarketData(signal.token_address);
   const currentMcap = marketData?.marketCap ?? null;
@@ -4435,7 +7465,7 @@ async function formatBestUserPickPlain(
 
   const userLabel = await resolveUserLabel(interaction, pick.userId);
 
-  return `${userLabel} | ${actionPlainLabel(pick.action)} | ${getSymbolLabel(pick.signal)} ${formatReturnX(pick.returnX)}`;
+  return `${userLabel}｜${actionPlainLabel(pick.action)}｜${getSymbolLabel(pick.signal)} ${formatReturnX(pick.returnX)}`;
 }
 
 async function formatBestUserPickWithoutMention(pick: UserPickReturn | null): Promise<string> {
@@ -4445,7 +7475,7 @@ async function formatBestUserPickWithoutMention(pick: UserPickReturn | null): Pr
 
   const userLabel = await resolveUserLabelById(pick.userId);
 
-  return `${userLabel} | ${actionPlainLabel(pick.action)} | ${getSymbolLabel(pick.signal)} ${formatReturnX(pick.returnX)}`;
+  return `${userLabel}｜${actionPlainLabel(pick.action)}｜${getSymbolLabel(pick.signal)} ${formatReturnX(pick.returnX)}`;
 }
 
 function getPickAverage(
@@ -4515,13 +7545,9 @@ function saveSignalMessage(signalId: string, message: Message): void {
 async function runMemeScanWithPoster(
   label: MemeScanLabel,
   context: MemeScanPostContext,
+  options: { postTopSignals?: boolean; sendDataCollectionSummary?: boolean } = {},
 ): Promise<MemeScanResult> {
-  const scanResult = await getMemeScanResult(label);
-  const firstReply = scanResult.replies[0];
-
-  if (!firstReply) {
-    throw new Error("表示できるResearch Cardがありません。");
-  }
+  const scanResult = await getMemeScanResult(label, options);
 
   saveScanRecord(
     scanResult.scanId,
@@ -4532,6 +7558,16 @@ async function runMemeScanWithPoster(
   );
   if (scanResult.signalIds.length > 0) {
     scheduleScanResultJobs(scanResult.scanId);
+  }
+
+  if (!scanResult.postTopSignals && options.sendDataCollectionSummary === false) {
+    return scanResult;
+  }
+
+  const firstReply = scanResult.replies[0];
+
+  if (!firstReply) {
+    throw new Error("表示できるResearch Cardがありません。");
   }
 
   const firstMessage = await context.sendFirst(firstReply);
@@ -4563,7 +7599,7 @@ async function runMemeScan(channel: SendableChannel, label: MemeScanLabel): Prom
     guildId: channel.guildId ?? null,
     sendFirst: (reply) => channel.send(reply),
     sendNext: (reply) => channel.send(reply),
-  });
+  }, { sendDataCollectionSummary: false });
 }
 
 function markPosted(scanId: string, window: ResultWindow): void {
@@ -4576,28 +7612,56 @@ function buildPostResultTokenField(performance: SignalPerformance, index: number
 
 function normalizeSignalType(value: string | null | undefined): SignalType {
   const allowed: SignalType[] = [
-    "🌱 Fresh Edge",
-    "🚨 Alert Edge",
-    "🔁 Re-Flow",
-    "🐋 Whale Flow",
-    "⚠️ Thin Liquidity",
-    "🤖 Bot-like Flow",
-    "❔ Unknown",
+    "alert_edge",
+    "flow_watch",
+    "thin_liquidity",
+    "bot_like_flow",
+    "whale_flow",
   ];
 
-  return allowed.includes(value as SignalType) ? (value as SignalType) : "❔ Unknown";
+  if (allowed.includes(value as SignalType)) {
+    return value as SignalType;
+  }
+
+  const normalized = value?.trim().toLowerCase();
+  const normalizedKey = normalized?.replace(/^[^a-z0-9]+/i, "").replace(/[\s-]+/g, "_");
+
+  if (normalizedKey === "alert_edge") return "alert_edge";
+  if (normalizedKey === "flow_watch") return "flow_watch";
+  if (
+    normalizedKey === "fresh_launch" ||
+    normalizedKey === "early_edge" ||
+    normalizedKey === "watch_candidate" ||
+    normalizedKey === "unknown" ||
+    normalizedKey === "re_flow" ||
+    normalizedKey === "fresh_edge"
+  ) return "flow_watch";
+  if (normalizedKey === "thin_liquidity") return "thin_liquidity";
+  if (normalizedKey === "bot_like_flow") return "bot_like_flow";
+  if (normalizedKey === "whale_flow") return "whale_flow";
+
+  if (value === "❔ Unknown" || value === "🌱 Fresh Edge" || value === "🔁 Re-Flow") {
+    return "flow_watch";
+  }
+
+  return "flow_watch";
+}
+
+function normalizePerformanceSignalType(performance: SignalPerformance): SignalType {
+  return normalizeSignalType(performance.signal.signal_type);
 }
 
 function buildSignalTypeReview(performances: SignalPerformance[]): string {
   const trackedTypes: SignalType[] = [
-    "🌱 Fresh Edge",
-    "🚨 Alert Edge",
-    "🔁 Re-Flow",
-    "⚠️ Thin Liquidity",
+    "alert_edge",
+    "flow_watch",
+    "thin_liquidity",
+    "bot_like_flow",
+    "whale_flow",
   ];
   const lines: string[] = [];
   const stats = trackedTypes.map((signalType) => {
-    const typed = performances.filter((performance) => normalizeSignalType(performance.signal.signal_type) === signalType);
+    const typed = performances.filter((performance) => normalizePerformanceSignalType(performance) === signalType);
     const returns = typed
       .map((performance) => performance.botReturnX)
       .filter((value): value is number => value !== null);
@@ -4613,24 +7677,19 @@ function buildSignalTypeReview(performances: SignalPerformance[]): string {
     .sort((a, b) => b.count - a.count)[0] ?? null;
 
   if (!topType) {
-    return "Signal Type別の傾向はまだN/Aです。";
+    return "Signal別の傾向はまだN/Aです。";
   }
 
-  lines.push(`今日は ${topType.signalType} が中心でした。`);
+  lines.push(`今日は ${formatSignalTypeLabel(topType.signalType)} が中心でした。`);
 
   for (const stat of stats) {
-    lines.push(`${stat.signalType}: ${stat.count}件 / 平均 ${formatReturnX(stat.average)}`);
+    lines.push(`${formatSignalTypeLabel(stat.signalType)}: ${stat.count}件｜平均 ${formatReturnX(stat.average)}`);
   }
 
-  const fresh = stats.find((stat) => stat.signalType === "🌱 Fresh Edge");
-  const reFlow = stats.find((stat) => stat.signalType === "🔁 Re-Flow");
+  const flowWatch = stats.find((stat) => stat.signalType === "flow_watch");
 
-  if ((fresh?.count ?? 0) > 0 && (fresh?.average ?? 0) > 1) {
-    lines.push("Flow/MCap 3%以上かつMCap $2M以下の候補は相対的に反応が良好でした。");
-  }
-
-  if ((reFlow?.count ?? 0) > 0) {
-    lines.push("Re-Flow候補はFresh Edgeと分けて、短期反応か継続流入かを次回も確認します。");
+  if ((flowWatch?.count ?? 0) > 0 && (flowWatch?.average ?? 0) > 1) {
+    lines.push("資金流入あり候補は相対的に反応が良好でした。Ageは別軸で確認します。");
   }
 
   return lines.join("\n");
@@ -4692,8 +7751,6 @@ async function buildScanResultEmbed(
   const bestBot = getBestBotPerformance(performances);
   const bestUserPick = getBestUserPick(performances);
   const averageReturn = average(botReturns);
-  const paperInStats = getPickAverage(performances, "paper_in");
-  const convictionStats = getPickAverage(performances, "conviction");
   const bestUserPickText = interaction
     ? await formatBestUserPickPlain(interaction, bestUserPick)
     : await formatBestUserPickWithoutMention(bestUserPick);
@@ -4705,17 +7762,21 @@ async function buildScanResultEmbed(
     .addFields(
       ...performances.map((performance, index) => buildPostResultTokenField(performance, index)),
       {
-        name: "サマリー",
+        name: "📊 Bot成績",
+        value: formatTreeRows([
+          ["候補数", formatCount(performances.length)],
+          ["2x", String(botReturns.filter((value) => value >= 2).length)],
+          ["5x", String(botReturns.filter((value) => value >= 5).length)],
+          ["10x", String(botReturns.filter((value) => value >= 10).length)],
+          ["平均成績", formatReturnX(averageReturn)],
+          ["中央値", formatReturnX(median(botReturns))],
+          ["Bot最高", bestBot ? `${getSymbolLabel(bestBot.signal)} ${formatReturnX(bestBot.botReturnX)}` : "N/A"],
+        ]).join("\n"),
+      },
+      {
+        name: "📌 補足",
         value: [
-          `Bot最高成績: ${
-            bestBot ? `${getSymbolLabel(bestBot.signal)} ${formatReturnX(bestBot.botReturnX)}` : "N/A"
-          }`,
-          `平均成績: ${formatReturnX(averageReturn)}`,
-          `1x超え: ${botReturns.filter((value) => value >= 1).length}/${performances.length}`,
-          `2x超え: ${botReturns.filter((value) => value >= 2).length}/${performances.length}`,
-          `エアIN平均: ${formatReturnXWithCount(paperInStats.average, paperInStats.count)}`,
-          `Conviction平均: ${formatReturnXWithCount(convictionStats.average, convictionStats.count)}`,
-          `ユーザー最高Pick: ${bestUserPickText}`,
+          `ユーザー最高: ${bestUserPickText}`,
         ].join("\n"),
       },
       {
@@ -4783,6 +7844,11 @@ async function postScheduledScanResult(scanId: string, window: ResultWindow): Pr
 }
 
 function scheduleScanResultJobs(scanId: string): void {
+  if (!AUTO_POST_RESULTS_ENABLED) {
+    console.log(`Result自動投稿はデフォルトOFFです。scan_id=${scanId}`);
+    return;
+  }
+
   const jobs: Array<{ window: ResultWindow; delayMs: number }> = [
     { window: "1h", delayMs: 60 * 60 * 1000 },
     { window: "6h", delayMs: 6 * 60 * 60 * 1000 },
@@ -4811,44 +7877,71 @@ function chunkArray<T>(values: T[], size: number): T[][] {
 }
 
 function buildResultTokenField(performance: SignalPerformance, index: number): { name: string; value: string } {
+  const signalType = normalizePerformanceSignalType(performance);
+
   return {
     name: `${index + 1}. ${getSymbolLabel(performance.signal)}`,
     value: [
-      `スキャン時：${formatCompactUsd(performance.signal.scan_mcap)} → 現在：${formatCompactUsd(performance.currentMcap)}`,
-      `Bot成績: ${formatReturnX(performance.botReturnX)}`,
-      `エアIN平均: ${formatReturnXWithCount(performance.paperInAvg, performance.paperInAvgCount)}`,
-      `Conviction平均: ${formatReturnXWithCount(performance.convictionAvg, performance.convictionAvgCount)}`,
+      "**判定**",
+      ...formatTreeRows([
+        ["Signal", formatSignalTypeLabel(signalType)],
+        ["Risk", formatDisplayRiskLine(getSignalRiskLabels(signalType))],
+      ]),
+      "**Stats**",
+      ...formatTreeRows([
+        ["スキャン時", formatCompactUsd(performance.signal.scan_mcap)],
+        ["現在", formatCompactUsd(performance.currentMcap)],
+        ["Bot成績", formatReturnX(performance.botReturnX)],
+        ["Conviction平均", formatReturnXWithCount(performance.convictionAvg, performance.convictionAvgCount)],
+        ["エアIN平均", formatReturnXWithCount(performance.paperInAvg, performance.paperInAvgCount)],
+      ]),
     ].join("\n"),
   };
 }
 
-async function buildResultsSummaryLines(
-  interaction: ChatInputCommandInteraction,
+function formatSignalTypeCounts(performances: SignalPerformance[]): string {
+  const counts = new Map<string, number>();
+
+  for (const performance of performances) {
+    const signalLabel = formatSignalTypeLabel(normalizePerformanceSignalType(performance));
+
+    counts.set(signalLabel, (counts.get(signalLabel) ?? 0) + 1);
+  }
+
+  return Array.from(counts.entries())
+    .sort((a, b) => b[1] - a[1])
+    .map(([signalLabel, count]) => `${signalLabel} ${count}`)
+    .join("｜") || "N/A";
+}
+
+function buildResultsSummaryLines(
   performances: SignalPerformance[],
-  period: MemeResultsPeriod,
-): Promise<string[]> {
+): string[] {
   const botReturns = performances
     .map((performance) => performance.botReturnX)
     .filter((value): value is number => value !== null);
   const bestBot = getBestBotPerformance(performances);
-  const averageReturn = average(botReturns);
+
+  return formatTreeRows([
+    ["候補数", formatCount(performances.length)],
+    ["2x", String(botReturns.filter((value) => value >= 2).length)],
+    ["5x", String(botReturns.filter((value) => value >= 5).length)],
+    ["10x", String(botReturns.filter((value) => value >= 10).length)],
+    ["平均成績", formatReturnX(average(botReturns))],
+    ["中央値", formatReturnX(median(botReturns))],
+    ["Bot最高", bestBot ? `${getSymbolLabel(bestBot.signal)} ${formatReturnX(bestBot.botReturnX)}` : "N/A"],
+  ]);
+}
+
+async function buildResultsSupplementLines(
+  interaction: ChatInputCommandInteraction,
+  performances: SignalPerformance[],
+): Promise<string[]> {
   const bestUserPick = await formatBestUserPick(interaction, getBestUserPick(performances));
-  const paperInStats = getPickAverage(performances, "paper_in");
-  const convictionStats = getPickAverage(performances, "conviction");
 
   return [
-    period === "daily"
-      ? `今日のBot候補数: ${formatCount(performances.length)}`
-      : `Bot候補数: ${formatCount(performances.length)}`,
-    `Bot最高成績: ${
-      bestBot ? `${getSymbolLabel(bestBot.signal)} ${formatReturnX(bestBot.botReturnX)}` : "N/A"
-    }`,
-    `平均成績: ${formatReturnX(averageReturn)}`,
-    `1x超え: ${botReturns.filter((value) => value >= 1).length}/${performances.length}`,
-    `2x超え: ${botReturns.filter((value) => value >= 2).length}/${performances.length}`,
-    `エアIN平均: ${formatReturnXWithCount(paperInStats.average, paperInStats.count)}`,
-    `Conviction平均: ${formatReturnXWithCount(convictionStats.average, convictionStats.count)}`,
-    `ユーザー最高Pick: ${bestUserPick}`,
+    `ユーザー最高: ${bestUserPick}`,
+    `Signal: ${formatSignalTypeCounts(performances)}`,
   ];
 }
 
@@ -4868,23 +7961,25 @@ async function buildLatestResultsEmbed(
   }
 
   const performances = await buildSignalPerformances(signals, "latest");
-  const summaryLines = await buildResultsSummaryLines(interaction, performances, "latest");
+  const summaryLines = buildResultsSummaryLines(performances);
+  const supplementLines = await buildResultsSupplementLines(interaction, performances);
 
   return new EmbedBuilder()
     .setTitle("📊 bb Meme Edge Results - 最新スキャン")
     .setColor(0x3498db)
     .setDescription([
-      "最新スキャンの候補が現在どれくらい動いたかを表示します。",
-      "",
-      "この結果は最新スキャン内のPickだけを集計しています。",
-      "今日の全Pick結果を見る場合は /meme-results period:daily を使ってください。",
-      "過去の自分のPickは /my-picks で確認できます。",
+      "最新スキャンの成績です。",
+      "全期間の結果は /meme-results period:daily、個人成績は /my。",
     ].join("\n"))
     .addFields(
       ...performances.map((performance, index) => buildResultTokenField(performance, index)),
       {
-        name: "サマリー",
+        name: "📊 サマリー",
         value: summaryLines.join("\n"),
+      },
+      {
+        name: "📌 補足",
+        value: supplementLines.join("\n"),
       },
     )
     .setTimestamp(new Date());
@@ -4923,10 +8018,9 @@ async function buildPeriodResultsEmbed(
   }
 
   const performances = await buildSignalPerformances(signals, period);
-  const summaryLines = await buildResultsSummaryLines(interaction, performances, period);
-  const description = period === "daily"
-    ? "JST基準の今日に作成された全signalsと、それに紐づくエアIN / ConvictionのPickを集計します。"
-    : "対象期間の保存済みシグナル全体のBot Performanceを表示します。";
+  const summaryLines = buildResultsSummaryLines(performances);
+  const supplementLines = await buildResultsSupplementLines(interaction, performances);
+  const description = `${formatPeriodLabel(period)}の保存済み候補の成績です。個人成績は /my。`;
 
   if (period !== "daily") {
     return [
@@ -4934,10 +8028,16 @@ async function buildPeriodResultsEmbed(
         .setTitle(`📊 bb Meme Edge Results - ${formatPeriodLabel(period)}`)
         .setColor(0x3498db)
         .setDescription(description)
-        .addFields({
-          name: "サマリー",
-          value: summaryLines.join("\n"),
-        })
+        .addFields(
+          {
+            name: "📊 サマリー",
+            value: summaryLines.join("\n"),
+          },
+          {
+            name: "📌 補足",
+            value: supplementLines.join("\n"),
+          },
+        )
         .setTimestamp(new Date()),
     ];
   }
@@ -4958,8 +8058,11 @@ async function buildPeriodResultsEmbed(
 
     if (chunkIndex === chunks.length - 1) {
       embed.addFields({
-        name: "サマリー",
+        name: "📊 サマリー",
         value: summaryLines.join("\n"),
+      }, {
+        name: "📌 補足",
+        value: supplementLines.join("\n"),
       });
     }
 
@@ -5004,7 +8107,7 @@ function getRecapTitle(period: MemeRecapPeriod): string {
     return "🏆 Weekly bb Meme Edge Recap";
   }
 
-  return "📅 Monthly bb Meme Edge Report";
+  return "🏆 Monthly bb Meme Edge Recap";
 }
 
 function getRecapPeriodLabel(period: MemeRecapPeriod): string {
@@ -5031,18 +8134,15 @@ function buildBotPerformanceSummary(performances: SignalPerformance[]): string {
     .filter((value): value is number => value !== null);
   const bestBot = getBestBotPerformance(performances);
 
-  return [
-    `Signals: ${formatCount(performances.length)}`,
-    `1x超え: ${botReturns.filter((value) => value >= 1).length}`,
-    `2x超え: ${botReturns.filter((value) => value >= 2).length}`,
-    `5x超え: ${botReturns.filter((value) => value >= 5).length}`,
-    `10x超え: ${botReturns.filter((value) => value >= 10).length}`,
-    `平均成績: ${formatReturnX(average(botReturns))}`,
-    `中央値: ${formatReturnX(median(botReturns))}`,
-    `Bot最高成績: ${
-      bestBot ? `${getSymbolLabel(bestBot.signal)} ${formatReturnX(bestBot.botReturnX)}` : "N/A"
-    }`,
-  ].join("\n");
+  return formatTreeRows([
+    ["候補数", formatCount(performances.length)],
+    ["2x", String(botReturns.filter((value) => value >= 2).length)],
+    ["5x", String(botReturns.filter((value) => value >= 5).length)],
+    ["10x", String(botReturns.filter((value) => value >= 10).length)],
+    ["平均成績", formatReturnX(average(botReturns))],
+    ["中央値", formatReturnX(median(botReturns))],
+    ["Bot最高", bestBot ? `${getSymbolLabel(bestBot.signal)} ${formatReturnX(bestBot.botReturnX)}` : "N/A"],
+  ]).join("\n");
 }
 
 function compareBestPick(a: PickPerformance, b: PickPerformance): number {
@@ -5067,33 +8167,9 @@ async function buildCommunityPerformanceSummary(
 ): Promise<string> {
   const paperIns = picks.filter((pick) => pick.normalizedAction === "paper_in");
   const convictions = picks.filter((pick) => pick.normalizedAction === "conviction");
-  const scoredPicks = [...paperIns, ...convictions].filter((pick) => pick.returnX !== null);
-  const paperInReturns = paperIns
-    .map((pick) => pick.returnX)
-    .filter((value): value is number => value !== null);
-  const convictionReturns = convictions
-    .map((pick) => pick.returnX)
-    .filter((value): value is number => value !== null);
-  const bestPick = scoredPicks.slice().sort(compareBestPick)[0] ?? null;
-  const bestPickLabel = bestPick
-    ? interaction
-      ? await resolveUserLabel(interaction, bestPick.user_id)
-      : resolveUserLabelById(bestPick.user_id)
-    : null;
-  const bestPickText = bestPick
-    ? `${bestPickLabel} | ${actionPlainLabel(bestPick.normalizedAction)} | ${
-      bestPick.symbol ? `$${bestPick.symbol}` : shortenAddress(bestPick.token_address)
-    } ${formatReturnX(bestPick.returnX)}`
-    : "N/A";
+  void interaction;
 
-  return [
-    `👀 Watch: ${picks.filter((pick) => pick.normalizedAction === "watch").length}`,
-    `🧪 エアIN: ${paperIns.length}`,
-    `🔥 Conviction: ${convictions.length}`,
-    `エアIN平均: ${formatReturnXWithCount(average(paperInReturns), paperInReturns.length)}`,
-    `Conviction平均: ${formatReturnXWithCount(average(convictionReturns), convictionReturns.length)}`,
-    `ユーザー最高Pick: ${bestPickText}`,
-  ].join("\n");
+  return `Conviction: ${convictions.length}｜エアIN: ${paperIns.length}｜Watch: ${picks.filter((pick) => pick.normalizedAction === "watch").length}`;
 }
 
 async function buildLeaderboardTop3Summary(
@@ -5108,7 +8184,7 @@ async function buildLeaderboardTop3Summary(
     .slice(0, 3);
 
   if (performances.length === 0) {
-    return "ランキング対象のPickはまだありません。";
+    return "Leaderboard: まだ対象なし";
   }
 
   const lines: string[] = [];
@@ -5118,15 +8194,10 @@ async function buildLeaderboardTop3Summary(
       ? await resolveUserLabel(interaction, performance.userId)
       : resolveUserLabelById(performance.userId);
 
-    lines.push(
-      `${index + 1}. ${userLabel}`,
-      `Score: ${formatScore(performance.totalScore)}`,
-      `ROI: ${formatReturnX(performance.roi)}`,
-      "",
-    );
+    lines.push(`${index + 1}. ${userLabel} ${formatScore(performance.totalScore)}｜ROI ${formatReturnX(performance.roi)}`);
   }
 
-  return lines.join("\n").trim();
+  return `Leaderboard: ${lines.join("｜")}`;
 }
 
 type NarrativeCategory =
@@ -5175,7 +8246,7 @@ function classifyNarrative(signal: ResultSignalRecord): NarrativeCategory {
 
 function buildNarrativeSummary(period: MemeRecapPeriod, performances: SignalPerformance[]): string {
   if (performances.length === 0) {
-    return "対象期間のsignalsがないため、ナラティブ集計はN/Aです。";
+    return "対象期間のsignalsがないため、テーマ別の内部集計はN/Aです。";
   }
 
   const stats = new Map<NarrativeCategory, { count: number; best: SignalPerformance | null }>();
@@ -5200,7 +8271,7 @@ function buildNarrativeSummary(period: MemeRecapPeriod, performances: SignalPerf
   const periodLabel = getRecapPeriodLabel(period);
 
   if (!bestCategory || !bestPerformance) {
-    return `${periodLabel}は ${topCategories.join(" と ")} が多く検出されました。現在値が取れた候補が少ないため、伸びたナラティブ判断はN/Aです。`;
+    return `${periodLabel}は ${topCategories.join(" と ")} が多く検出されました。現在値が取れた候補が少ないため、テーマ別の伸びはN/Aです。`;
   }
 
   const lead = `${periodLabel}は ${topCategories.join(" と ")} が多く検出されました。`;
@@ -5213,7 +8284,7 @@ function buildNarrativeSummary(period: MemeRecapPeriod, performances: SignalPerf
   const detail = ranked
     .slice(0, 3)
     .map(([category, value]) => `${category}: ${value.count}件`)
-    .join(" / ");
+    .join("｜");
 
   return [lead, bestLine, `内訳: ${detail}`].join("\n");
 }
@@ -5240,17 +8311,22 @@ function buildRecapNansenSignalReview(period: MemeRecapPeriod, performances: Sig
   const lowMcap = signals.filter((signal) => (signal.scan_mcap ?? Infinity) < 500_000).length;
   const highMcap = signals.filter((signal) => (signal.scan_mcap ?? 0) >= 10_000_000).length;
   const activeTraders = signals.filter((signal) => (signal.trader_count ?? 0) >= 25).length;
-  const youngTokens = signals.filter((signal) => {
+  const freshWindowTokens = signals.filter((signal) => {
     const ageDays = parseTokenAgeDays(signal.token_age);
 
-    return ageDays !== null && ageDays <= 30;
+    return ageDays !== null && ageDays <= 3;
+  }).length;
+  const watchWindowTokens = signals.filter((signal) => {
+    const ageDays = parseTokenAgeDays(signal.token_age);
+
+    return ageDays !== null && ageDays > 3 && ageDays <= 30;
   }).length;
   const bestBot = getBestBotPerformance(performances);
   const lines = [
     `Flow/MCapが高い候補: ${highFlowMcap}件 / 24hと7d Flowが両方プラス: ${bothFlowPositive}件`,
     `24h Flowだけ強く7d Flowが弱い候補: ${shortOnly}件`,
     `MCap $500K未満: ${lowMcap}件 / MCap $10.00M以上: ${highMcap}件`,
-    `Trader 25人以上: ${activeTraders}件 / token age 30日以内: ${youngTokens}件`,
+    `Trader 25人以上: ${activeTraders}件 / 0〜3日: ${freshWindowTokens}件 / 4〜30日: ${watchWindowTokens}件`,
   ];
 
   if (bestBot) {
@@ -5297,7 +8373,7 @@ function getLearningReturnX(performance: SignalPerformance): number | null {
 }
 
 function getLearningBestSymbol(performance: SignalPerformance): string {
-  return performance.signal.symbol ? `$${performance.signal.symbol}` : shortenAddress(performance.signal.token_address);
+  return performance.signal.symbol ? formatDisplaySymbol(performance.signal.symbol) : shortenAddress(performance.signal.token_address);
 }
 
 function buildLearningBucketStats(
@@ -5359,11 +8435,7 @@ function getAgeBucket(tokenAge: string | null): string {
   const ageDays = parseTokenAgeDays(tokenAge);
 
   if (ageDays === null) return "Unknown";
-  if (ageDays <= 1) return "0〜1日";
-  if (ageDays <= 7) return "2〜7日";
-  if (ageDays <= 30) return "8〜30日";
-  if (ageDays <= 180) return "31〜180日";
-  return "180日以上";
+  return findAgeScoringBucket(ageDays)?.label ?? "Unknown";
 }
 
 function getFlowMcapBucket(flowMcapRatio: number | null): string {
@@ -5420,10 +8492,9 @@ function buildLearningNextScoreAdjustment(data: LearningSummaryData, sampleCount
   }
 
   const lines: string[] = [];
-  const freshAvg = statAverage(data.signalType, "🌱 Fresh Edge");
-  const alertAvg = statAverage(data.signalType, "🚨 Alert Edge");
-  const reFlowAvg = statAverage(data.signalType, "🔁 Re-Flow");
-  const thinAvg = statAverage(data.signalType, "⚠️ Thin Liquidity");
+  const flowWatchAvg = statAverage(data.signalType, "flow_watch");
+  const alertAvg = statAverage(data.signalType, "alert_edge");
+  const thinAvg = statAverage(data.signalType, "thin_liquidity");
   const lowMcapAvg = average([
     statAverage(data.mcap, "$50K〜$500K"),
     statAverage(data.mcap, "$500K〜$2M"),
@@ -5432,16 +8503,16 @@ function buildLearningNextScoreAdjustment(data: LearningSummaryData, sampleCount
     statAverage(data.mcap, "$5M〜$10M"),
     statAverage(data.mcap, "$10M以上"),
   ].filter((value): value is number => value !== null));
-  const youngAgeAvg = average([
-    statAverage(data.age, "0〜1日"),
-    statAverage(data.age, "2〜7日"),
-  ].filter((value): value is number => value !== null));
+  const youngAgeLabels = scoringConfig.ageBuckets.slice(0, 2).map((bucket) => bucket.label);
+  const youngAgeAvg = average(youngAgeLabels
+    .map((label) => statAverage(data.age, label))
+    .filter((value): value is number => value !== null));
   const clusterHighAvg = statAverage(data.clusterRisk, "High");
   const microArbAvg = statAverage(data.walletBehavior, "Micro-arb");
   const mirrorAvg = statAverage(data.walletBehavior, "Mirror-like");
 
-  if ((freshAvg ?? 0) >= 1.2 || (alertAvg ?? 0) >= 1.2) {
-    lines.push("Fresh Edge / Alert Edgeの反応が良いため、Quality Gate通過候補を引き続き優先します。");
+  if ((flowWatchAvg ?? 0) >= 1.2 || (alertAvg ?? 0) >= 1.2) {
+    lines.push("Flow Watch / Alert Edgeの反応が良いため、Quality Gate通過候補を引き続き優先します。");
   }
 
   if ((lowMcapAvg ?? 0) >= 1.2) {
@@ -5449,11 +8520,11 @@ function buildLearningNextScoreAdjustment(data: LearningSummaryData, sampleCount
   }
 
   if ((youngAgeAvg ?? 0) >= 1.2) {
-    lines.push("Age 7日以内のFreshnessを重視します。");
+    lines.push("Ageの若いbucketをスコア上は引き続き重視します。");
   }
 
-  if ((reFlowAvg ?? 1) < 1 || (thinAvg ?? 1) < 1) {
-    lines.push("Re-FlowやThin Liquidityは優先度を下げ、条件が強い時だけ残します。");
+  if ((thinAvg ?? 1) < 1) {
+    lines.push("Thin Liquidityは優先度を下げ、条件が強い時だけ残します。");
   }
 
   if ((highMcapAvg ?? 1) < 1) {
@@ -5473,14 +8544,20 @@ function buildLearningSummaryData(performances: SignalPerformance[]): LearningSu
   const deepChecksBySignal = getLatestDeepCheckBySignal();
   const walletBehaviorsBySignal = getWalletBehaviorsBySignal();
   const validPerformances = performances.filter((performance) => getLearningReturnX(performance) !== null);
-  const signalTypeLabels = ["🌱 Fresh Edge", "🚨 Alert Edge", "🔁 Re-Flow", "🐋 Whale Flow", "⚠️ Thin Liquidity", "🤖 Bot-like Flow", "❔ Unknown"];
+  const signalTypeLabels: SignalType[] = [
+    "alert_edge",
+    "flow_watch",
+    "thin_liquidity",
+    "bot_like_flow",
+    "whale_flow",
+  ];
   const mcapLabels = ["$50K未満", "$50K〜$500K", "$500K〜$2M", "$2M〜$5M", "$5M〜$10M", "$10M以上", "Unknown"];
-  const ageLabels = ["0〜1日", "2〜7日", "8〜30日", "31〜180日", "180日以上", "Unknown"];
+  const ageLabels = [...scoringConfig.ageBuckets.map((bucket) => bucket.label), "Unknown"];
   const flowLabels = ["0〜0.3%", "0.3〜1%", "1〜3%", "3〜5%", "5%以上", "Unknown"];
   const clusterLabels = ["Low", "Medium", "High", "未検証 / N/A"];
   const behaviorLabels: WalletBehaviorType[] = ["Fresh Sniper", "Accumulator", "Fast Flipper", "Micro-arb", "Mirror-like", "Unknown"];
   const data: LearningSummaryData = {
-    signalType: groupLearningStats(signalTypeLabels, validPerformances, (performance) => normalizeSignalType(performance.signal.signal_type)),
+    signalType: groupLearningStats(signalTypeLabels, validPerformances, (performance) => normalizePerformanceSignalType(performance)),
     mcap: groupLearningStats(mcapLabels, validPerformances, (performance) => getMcapBucket(performance.signal.scan_mcap)),
     age: groupLearningStats(ageLabels, validPerformances, (performance) => getAgeBucket(performance.signal.token_age)),
     flowMcap: groupLearningStats(flowLabels, validPerformances, (performance) => getFlowMcapBucket(performance.signal.flow_mcap_ratio)),
@@ -5514,19 +8591,87 @@ function formatLearningSection(title: string, stats: LearningBucketStats[], limi
   return [`${title}:`, ...(lines.length > 0 ? lines : ["N/A"])].join("\n");
 }
 
-function buildLearningSummaryText(data: LearningSummaryData, period: MemeRecapPeriod): string {
-  const detailLimit = period === "daily" ? 3 : 4;
-  const sections = [
-    formatLearningSection("Signal Type別", data.signalType, detailLimit, true),
-    formatLearningSection("MCap帯別", data.mcap, detailLimit),
-    formatLearningSection("Age帯別", data.age, detailLimit),
-    formatLearningSection("Flow/MCap帯別", data.flowMcap, detailLimit),
-    formatLearningSection("Cluster Risk別", data.clusterRisk, 3),
-    formatLearningSection("Wallet Behavior別", data.walletBehavior, detailLimit),
-    ["Next Score Adjustment:", data.nextScoreAdjustment].join("\n"),
-  ];
+function bulletize(lines: string[]): string {
+  return lines.map((line) => `• ${line}`).join("\n");
+}
 
-  return sections.join("\n\n").slice(0, 1_000);
+function statByLabel(stats: LearningBucketStats[], label: string): LearningBucketStats | null {
+  return stats.find((stat) => stat.label === label) ?? null;
+}
+
+function buildLearningSummaryText(data: LearningSummaryData, performances: SignalPerformance[]): string {
+  const returns = performances
+    .map((performance) => performance.botReturnX)
+    .filter((value): value is number => value !== null);
+  const twoXCount = returns.filter((value) => value >= 2).length;
+  const averageReturn = average(returns);
+  const signals = performances.map((performance) => performance.signal);
+  const shortOnlyCount = signals.filter((signal) => (signal.flow_24h ?? 0) > 0 && (signal.flow_7d ?? 0) <= 0).length;
+  const unverifiedCluster = statByLabel(data.clusterRisk, "未検証 / N/A")?.count ?? 0;
+  const walletSampleCount = data.walletBehavior.reduce((sum, stat) => sum + stat.count, 0);
+  const lines: string[] = [];
+
+  if (twoXCount === 0) {
+    lines.push("今回は全体的に弱め。2x超えなし。");
+  } else if ((averageReturn ?? 0) >= 1) {
+    lines.push(`平均は${formatReturnX(averageReturn)}で、2x超えが${twoXCount}件ありました。`);
+  } else {
+    lines.push(`2x超えは${twoXCount}件ありましたが、平均は${formatReturnX(averageReturn)}に留まりました。`);
+  }
+
+  if (shortOnlyCount > 0) {
+    lines.push("24h Flow単独の候補は伸び切らず、継続flow確認が必要。");
+  }
+
+  if (unverifiedCluster > 0 || walletSampleCount === 0) {
+    lines.push("Cluster / Wallet Quality未検証が多く、追加検証サンプルが必要。");
+  }
+
+  if (lines.length < 3) {
+    lines.push("次回もMCap、継続flow、Wallet Qualityを優先して確認。");
+  }
+
+  return bulletize(lines.slice(0, 3));
+}
+
+function buildPatternSummaryText(data: LearningSummaryData, performances: SignalPerformance[]): string {
+  const bestBot = getBestBotPerformance(performances);
+  const lowMcapStat = statByLabel(data.mcap, "$50K〜$500K");
+  const highFlowStats = ["3〜5%", "5%以上"]
+    .map((label) => statByLabel(data.flowMcap, label))
+    .filter((stat): stat is LearningBucketStats => stat !== null && stat.count > 0);
+  const highFlowAverage = average(
+    highFlowStats
+      .map((stat) => stat.average)
+      .filter((value): value is number => value !== null),
+  );
+  const lines: string[] = [];
+
+  if (bestBot) {
+    lines.push(`Bot最高: ${getSymbolLabel(bestBot.signal)} ${formatReturnX(bestBot.botReturnX)}｜MCap ${formatCompactUsd(bestBot.signal.scan_mcap)}`);
+  }
+
+  if (lowMcapStat && lowMcapStat.count > 0) {
+    lines.push(
+      (lowMcapStat.average ?? 0) >= 1
+        ? "MCap $50K〜$500K枠に反応あり。"
+        : "MCap $50K〜$500K枠は弱め。",
+    );
+  }
+
+  if (highFlowStats.length > 0) {
+    lines.push(
+      (highFlowAverage ?? 0) >= 1
+        ? "Flow/MCapが高い候補は相対的に反応あり。"
+        : "Flow/MCapが高くても継続flowがない候補は弱め。",
+    );
+  }
+
+  if (lines.length === 0) {
+    lines.push("注目できるパターンはまだ不足。次回以降のサンプルを蓄積。");
+  }
+
+  return bulletize(lines.slice(0, 3));
 }
 
 function saveLearningSummary(
@@ -5572,10 +8717,8 @@ async function buildMemeRecapReply(
     botSummary: buildBotPerformanceSummary(performances),
     communitySummary: await buildCommunityPerformanceSummary(interaction, pickPerformances),
     leaderboardSummary: await buildLeaderboardTop3Summary(interaction, pickPerformances),
-    narrativeSummary: buildNarrativeSummary(period, performances),
-    nansenSignalReview: buildRecapNansenSignalReview(period, performances),
-    learningSummary: buildLearningSummaryText(learningData, period),
-    nextAdjustment: learningData.nextScoreAdjustment,
+    nansenSignalReview: buildPatternSummaryText(learningData, performances),
+    learningSummary: buildLearningSummaryText(learningData, performances),
   };
   const createdAt = now.toISOString();
 
@@ -5587,8 +8730,8 @@ async function buildMemeRecapReply(
     endIso,
     summary.botSummary,
     summary.communitySummary,
-    summary.narrativeSummary,
-    summary.nansenSignalReview,
+    "",
+    summary.learningSummary,
     createdAt,
   );
   saveLearningSummary(period, startIso, endIso, learningData, createdAt);
@@ -5598,15 +8741,12 @@ async function buildMemeRecapReply(
       new EmbedBuilder()
         .setTitle(getRecapTitle(period))
         .setColor(period === "monthly" ? 0x9b59b6 : 0xf1c40f)
-        .setDescription(`対象期間: ${formatJstResultDateTime(startIso)} - ${formatJstResultDateTime(endIso)} JST`)
+        .setDescription(`期間: ${formatJstResultDateTime(startIso)} - ${formatJstResultDateTime(endIso)} JST`)
         .addFields(
-          { name: "Bot Performance", value: summary.botSummary },
-          { name: "Community Performance", value: summary.communitySummary },
-          { name: "Leaderboard Top3", value: summary.leaderboardSummary },
-          { name: "Narrative Summary", value: summary.narrativeSummary },
-          { name: "Nansen Signal Review", value: summary.nansenSignalReview },
-          { name: "Learning Summary", value: summary.learningSummary },
-          { name: "Next Adjustment", value: summary.nextAdjustment },
+          { name: "📊 Bot成績", value: summary.botSummary },
+          { name: "🧠 学び", value: summary.learningSummary },
+          { name: "🔍 注目パターン", value: summary.nansenSignalReview },
+          { name: "👥 Community", value: [summary.communitySummary, summary.leaderboardSummary].join("\n") },
         )
         .setTimestamp(now),
     ],
@@ -5633,7 +8773,138 @@ async function runMemeRecap(
 }
 
 function getSymbolFromBestPick(bestPick: BestPerformancePick): string {
-  return bestPick.symbol ? `$${bestPick.symbol}` : shortenAddress(bestPick.tokenAddress);
+  return bestPick.symbol ? formatDisplaySymbol(bestPick.symbol) : shortenAddress(bestPick.tokenAddress);
+}
+
+function formatMyReturnX(value: number | null): string {
+  if (value === null || !Number.isFinite(value)) {
+    return "N/A";
+  }
+
+  return `${value.toFixed(2)}x`;
+}
+
+function formatMyAverageReturnX(value: number | null): string {
+  if (value === null || !Number.isFinite(value)) {
+    return "N/A";
+  }
+
+  return `${value.toFixed(2)}x`;
+}
+
+function formatPickSymbol(symbol: string | null, tokenAddress: string): string {
+  void tokenAddress;
+  return formatDisplaySymbol(symbol);
+}
+
+function formatWinRate(value: number | null): string {
+  if (value === null || !Number.isFinite(value)) {
+    return "N/A";
+  }
+
+  return `${(value * 100).toFixed(1)}%`;
+}
+
+function averagePickDisplayReturn(picks: PickPerformance[]): number | null {
+  return average(
+    picks
+      .map((pick) => calculateReturnX(pick.currentMcap, pick.entry_mcap))
+      .filter((value): value is number => value !== null),
+  );
+}
+
+function formatMyActionStatsValue(action: PickAction, picks: PickPerformance[]): string {
+  const actionPicks = picks.filter((pick) => pick.normalizedAction === action);
+  const averageReturn = averagePickDisplayReturn(actionPicks);
+  const pickText = actionPicks.length === 1 ? "pick" : "picks";
+
+  return `${actionPicks.length} ${pickText}｜平均 ${formatMyAverageReturnX(averageReturn)}`;
+}
+
+function formatMyRecentPickGroups(
+  rows: Array<{ pick: PickPerformance; displayReturnX: number | null }>,
+): Array<[string, string]> {
+  const recentRows = rows
+    .slice()
+    .sort((a, b) => new Date(b.pick.clicked_at).getTime() - new Date(a.pick.clicked_at).getTime())
+    .slice(0, 5);
+
+  return (["conviction", "paper_in", "watch"] as const)
+    .map((action) => {
+      const items = recentRows
+        .filter((row) => row.pick.normalizedAction === action)
+        .map((row) =>
+          `${formatPickSymbol(row.pick.symbol, row.pick.token_address)} ${formatMyReturnX(row.displayReturnX)}`,
+        );
+
+      return items.length > 0 ? ([actionPlainLabel(action), items.join("｜")] as [string, string]) : null;
+    })
+    .filter((line): line is [string, string] => line !== null);
+}
+
+async function getMyReply(
+  interaction: ChatInputCommandInteraction,
+): Promise<{ embeds: [InstanceType<typeof EmbedBuilder>] } | { content: string }> {
+  const now = new Date();
+  const todayJst = getJstDateString(now);
+
+  getOrCreateUser(interaction.user.id, now.toISOString(), todayJst);
+
+  const rows = getUserPicksWithSignals.all(interaction.user.id) as UserPickWithSignalRecord[];
+  const pickPerformances = await buildPickPerformances(rows);
+  const displayRows = pickPerformances.map((pick) => ({
+    pick,
+    displayReturnX: calculateReturnX(pick.currentMcap, pick.entry_mcap),
+  }));
+  const displayReturns = displayRows
+    .map((row) => row.displayReturnX)
+    .filter((value): value is number => value !== null);
+  const displayWinRate = displayReturns.length > 0
+    ? displayReturns.filter((value) => value > 1).length / displayReturns.length
+    : null;
+  const bestDisplayPick = displayRows
+    .filter((row): row is { pick: PickPerformance; displayReturnX: number } => row.displayReturnX !== null)
+    .sort((a, b) => b.displayReturnX - a.displayReturnX)[0] ?? null;
+  const recentLines = formatMyRecentPickGroups(displayRows);
+  const summaryLines = formatTreeRows([
+    ["Picks", String(pickPerformances.length)],
+    ["勝率", formatWinRate(displayWinRate)],
+    ["平均", formatMyReturnX(average(displayReturns))],
+    [
+      "最高Pick",
+      bestDisplayPick
+        ? `${formatPickSymbol(bestDisplayPick.pick.symbol, bestDisplayPick.pick.token_address)} ${formatMyReturnX(bestDisplayPick.displayReturnX)}`
+        : "N/A",
+    ],
+  ]);
+  const actionStatsLines = formatTreeRows([
+    ["Conviction", formatMyActionStatsValue("conviction", pickPerformances)],
+    ["エアIN", formatMyActionStatsValue("paper_in", pickPerformances)],
+    ["Watch", formatMyActionStatsValue("watch", pickPerformances)],
+  ]);
+
+  if (pickPerformances.length === 0) {
+    return { content: "まだPaper Pickはありません。Conviction / エアIN / Watch を押すと、ここに履歴と成績がまとまります。" };
+  }
+
+  return {
+    embeds: [
+      new EmbedBuilder()
+        .setTitle("👤 My Meme Edge")
+        .setColor(0x9b59b6)
+        .setDescription([
+          "📊 成績サマリー",
+          ...summaryLines,
+          "",
+          "📌 最近のPick",
+          ...formatTreeRows(recentLines),
+          "",
+          "🧠 ボタン別成績",
+          ...actionStatsLines,
+        ].join("\n"))
+        .setTimestamp(now),
+    ],
+  };
 }
 
 async function getLeaderboardReply(
@@ -5665,14 +8936,14 @@ async function getLeaderboardReply(
       `${index + 1}. ${userLabel}`,
       `Score: ${formatScore(performance.totalScore)}`,
       `ROI: ${formatReturnX(performance.roi)}`,
-      `Best Pick: ${
+      `最高Pick: ${
         performance.bestPick
           ? `${getSymbolFromBestPick(performance.bestPick)} ${formatReturnX(performance.bestPick.returnX)}`
           : "N/A"
       }`,
       `Hit Rate: ${formatHitRate(performance.hitRate)}`,
-      `Used Points: ${performance.totalUsedPoints}pt`,
-      `内訳: エアIN ${performance.paperInCount}件 / Conviction ${performance.convictionCount}件`,
+      `使用ポイント: ${performance.totalUsedPoints}pt`,
+      `内訳: Conviction ${performance.convictionCount}｜エアIN ${performance.paperInCount}｜Watch ${performance.watchCount}`,
       "",
     );
   }
@@ -5714,7 +8985,7 @@ async function getMyPerformanceReply(
 
   const recentLines = recentScoredPicks.length > 0
     ? recentScoredPicks.map((pick) => {
-      const symbol = pick.symbol ? `$${pick.symbol}` : shortenAddress(pick.token_address);
+      const symbol = pick.symbol ? formatDisplaySymbol(pick.symbol) : shortenAddress(pick.token_address);
 
       return `${pick.normalizedAction === "conviction" ? "🔥" : "🧪"} ${symbol} → ${formatReturnX(pick.returnX)} / ${formatScore(pick.pickScore)}`;
     })
@@ -5953,7 +9224,7 @@ async function buildMyPicksEmbed(
     .setColor(0x9b59b6)
     .addFields(
       ...displayedPicks.map((pick) => {
-        const symbol = pick.symbol ? `$${pick.symbol}` : shortenAddress(pick.token_address);
+        const symbol = pick.symbol ? formatDisplaySymbol(pick.symbol) : shortenAddress(pick.token_address);
         const lines = pick.normalizedAction === "watch"
           ? [
             "ランキング対象外",
@@ -5984,7 +9255,7 @@ async function buildMyPicksEmbed(
           `本日の残りポイント: ${Math.max(0, 5 - user.daily_points_used)}pt`,
           `ベストPick: ${
             bestPick
-              ? `${bestPick.symbol ? `$${bestPick.symbol}` : shortenAddress(bestPick.token_address)} ${formatReturnX(bestPick.returnX)}`
+              ? `${bestPick.symbol ? formatDisplaySymbol(bestPick.symbol) : shortenAddress(bestPick.token_address)} ${formatReturnX(bestPick.returnX)}`
               : "N/A"
           }`,
           normalizedPicks.length > displayedPicks.length
@@ -6090,7 +9361,7 @@ function buildPickReply(
   remainingToday: number,
   includeGuide: boolean,
 ): string {
-  const symbol = signal.symbol ? `$${signal.symbol}` : shortenAddress(signal.token_address);
+  const symbol = signal.symbol ? formatDisplaySymbol(signal.symbol) : shortenAddress(signal.token_address);
   const lines = [formatPickActionTitle(action)];
 
   if (action === "watch") {
@@ -6211,6 +9482,11 @@ async function handleMemePickButton(interaction: Interaction): Promise<void> {
   const nextEntryPrice = parsed.action === "watch" && existingPick
     ? existingPick.entry_price
     : entryData.price;
+  const signalTimeMs = signal.scan_time ? new Date(signal.scan_time).getTime() : NaN;
+  const timeSinceSignalMinutes = Number.isFinite(signalTimeMs)
+    ? Math.max(0, Math.round((now.getTime() - signalTimeMs) / 60_000))
+    : null;
+  const signalSource = signal.scan_id?.startsWith("alert") ? "alert" : signal.signal_type === "alert_edge" ? "alert" : "fresh_scan";
   const nextDailyPointsUsed = Math.max(0, user.daily_points_used + pointDiff);
   const includeGuide = user.has_seen_guide === 0;
 
@@ -6222,6 +9498,12 @@ async function handleMemePickButton(interaction: Interaction): Promise<void> {
         nowIso,
         nextEntryMcap,
         nextEntryPrice,
+        parsed.action,
+        timeSinceSignalMinutes,
+        nextEntryMcap,
+        nextEntryPrice,
+        signalSource,
+        signal.signal_type ?? null,
         existingPick.pick_id,
       );
     } else {
@@ -6234,6 +9516,12 @@ async function handleMemePickButton(interaction: Interaction): Promise<void> {
         nowIso,
         nextEntryMcap,
         nextEntryPrice,
+        parsed.action,
+        timeSinceSignalMinutes,
+        nextEntryMcap,
+        nextEntryPrice,
+        signalSource,
+        signal.signal_type ?? null,
       );
     }
 
@@ -6251,7 +9539,7 @@ async function handleMemePickButton(interaction: Interaction): Promise<void> {
     content: buildPickReply(
       parsed.action,
       signal,
-      { marketCap: nextEntryMcap, price: nextEntryPrice },
+      { marketCap: nextEntryMcap, price: nextEntryPrice, liquidity: null, volume24h: null, pairUrl: null },
       usedPoints,
       5 - nextDailyPointsUsed,
       includeGuide,
@@ -6470,9 +9758,8 @@ async function runScheduledMemeEdgeJobs(now = new Date()): Promise<void> {
     }
   }
 
-  // Alert CheckはNansenクレジットを消費し得るため、本番では頻度とキャッシュを確認して運用します。
-  if (parts.minute === 5) {
-    const alertRunKey = `${parts.date}T${String(parts.hour).padStart(2, "0")}:05:alert-check`;
+  if (parts.minute % scoringConfig.alertRules.intervalMinutes === 0) {
+    const alertRunKey = `${parts.date}T${String(parts.hour).padStart(2, "0")}:${String(parts.minute).padStart(2, "0")}:alert-check`;
 
     if (!scheduledJobRunKeys.has(alertRunKey)) {
       scheduledJobRunKeys.add(alertRunKey);
@@ -6642,18 +9929,18 @@ client.on("interactionCreate", async (interaction: Interaction) => {
     return;
   }
 
-  if (interaction.commandName === "my-picks") {
+  if (interaction.commandName === "my") {
     await interaction.deferReply({ ephemeral: true });
 
     try {
-      const reply = await getMyPicksReply(interaction);
+      const reply = await getMyReply(interaction);
 
       await interaction.editReply(reply);
     } catch (error) {
       console.error(error);
       const message = error instanceof Error ? error.message : "不明なエラー";
 
-      await interaction.editReply(`/my-picks に失敗しました: ${message}`);
+      await interaction.editReply(`/my に失敗しました: ${message}`);
     }
 
     return;
@@ -6671,23 +9958,6 @@ client.on("interactionCreate", async (interaction: Interaction) => {
       const message = error instanceof Error ? error.message : "不明なエラー";
 
       await interaction.editReply(`/leaderboard に失敗しました: ${message}`);
-    }
-
-    return;
-  }
-
-  if (interaction.commandName === "my-performance") {
-    await interaction.deferReply({ ephemeral: true });
-
-    try {
-      const reply = await getMyPerformanceReply(interaction);
-
-      await interaction.editReply(reply);
-    } catch (error) {
-      console.error(error);
-      const message = error instanceof Error ? error.message : "不明なエラー";
-
-      await interaction.editReply(`/my-performance に失敗しました: ${message}`);
     }
 
     return;
@@ -6809,7 +10079,8 @@ client.on("interactionCreate", async (interaction: Interaction) => {
 
       await interaction.editReply([
         "開発用コマンドを受け付けました。",
-        `スキャン本体をこのチャンネルに投稿します: ${labels[labelChoice]}`,
+        `Fresh Scanを実行します: ${labels[labelChoice]}`,
+        scoringConfig.freshScanRules.postTopSignals ? "投稿: ON" : "投稿: OFF（保存のみ）",
       ].join("\n"));
       const tracking = await withNansenCreditTracking(
         "/dev-run-scheduled-scan",
@@ -6864,7 +10135,7 @@ client.on("interactionCreate", async (interaction: Interaction) => {
       if (alertResult.posted.length === 0) {
         const rejectedLines = alertResult.rejected
           .slice(0, 5)
-          .map((item) => `- $${item.card.symbol}: ${item.gate.reasons.join(" / ") || "Quality Gate Rejected"}`);
+          .map((item) => `- ${formatDisplaySymbol(item.card.symbol)}: ${item.gate.reasons.join(" / ") || "Quality Gate Rejected"}`);
 
         await interaction.editReply([
           "Alert条件を満たす候補はありましたが、Deep CheckのQuality Gateを通過した候補はありませんでした。",
@@ -6881,7 +10152,7 @@ client.on("interactionCreate", async (interaction: Interaction) => {
 
       const rejectedLines = alertResult.rejected
         .slice(0, 5)
-        .map((item) => `- $${item.card.symbol}: ${item.gate.reasons.join(" / ") || "Quality Gate Rejected"}`);
+        .map((item) => `- ${formatDisplaySymbol(item.card.symbol)}: ${item.gate.reasons.join(" / ") || "Quality Gate Rejected"}`);
 
       await interaction.editReply([
         `Alert候補を${alertResult.checkedCount}件Deep Checkしました。`,
@@ -6976,7 +10247,9 @@ client.on("interactionCreate", async (interaction: Interaction) => {
   }
 
   if (interaction.commandName === "meme-scan") {
-    await interaction.deferReply();
+    const postTopSignals = interaction.options.getBoolean("post") ?? scoringConfig.freshScanRules.postTopSignals;
+
+    await interaction.deferReply({ ephemeral: !postTopSignals });
 
     try {
       const tracking = await withNansenCreditTracking(
@@ -6986,7 +10259,7 @@ client.on("interactionCreate", async (interaction: Interaction) => {
           guildId: interaction.guildId,
           sendFirst: (reply) => interaction.editReply(reply),
           sendNext: (reply) => interaction.followUp(reply),
-        }),
+        }, { postTopSignals }),
       );
 
       await interaction.followUp({
@@ -6995,7 +10268,7 @@ client.on("interactionCreate", async (interaction: Interaction) => {
       });
     } catch (error) {
       console.error(error);
-      const message = error instanceof Error ? error.message : "不明なエラー";
+      const message = formatMemeScanError(error);
 
       await interaction.editReply(`meme-scan に失敗しました: ${message}`);
     }
