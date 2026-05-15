@@ -123,6 +123,49 @@ type CandidatePerformanceSnapshotRecord = {
   created_at: string;
 };
 
+type SmartWalletObservationRecord = {
+  id: string;
+  wallet_address: string;
+  token_address: string;
+  symbol: string | null;
+  source_type: string;
+  alert_run_id: string | null;
+  alert_candidate_id: string | null;
+  scan_id: string | null;
+  scan_candidate_id: string | null;
+  observed_at: string;
+  side: string;
+  amount_usd: number | null;
+  token_mcap_at_observation: number | null;
+  token_price_at_observation: number | null;
+  flow_quality: string | null;
+  wallet_quality: string | null;
+  buyer_seller_balance: string | null;
+  sell_pressure: string | null;
+  holder_risk: string | null;
+  cluster_risk: string | null;
+  raw_context: string | null;
+  created_at: string;
+};
+
+type SmartWalletProfileAggregateRow = {
+  wallet_address: string;
+  observed_tokens_count: number;
+  observed_alert_tokens_count: number;
+  avg_return_1h: number | null;
+  avg_return_4h: number | null;
+  avg_return_24h: number | null;
+  avg_peak_return: number | null;
+  hit_2x_count: number;
+  hit_5x_count: number;
+  hit_10x_count: number;
+  early_entry_count: number;
+  bad_result_count: number;
+  bot_like_count: number;
+  high_risk_count: number;
+  last_seen_at: string | null;
+};
+
 const DB_PATH = path.join(process.cwd(), "data", "meme-edge.sqlite");
 
 function ensureColumn(db: SqliteDatabase, tableName: string, columnName: string, definition: string): void {
@@ -277,6 +320,53 @@ function runSchema(db: SqliteDatabase): void {
       mirror_group_id TEXT,
       cluster_risk TEXT,
       created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS smart_wallet_observations (
+      id TEXT PRIMARY KEY,
+      wallet_address TEXT NOT NULL,
+      token_address TEXT NOT NULL,
+      symbol TEXT,
+      source_type TEXT NOT NULL,
+      alert_run_id TEXT,
+      alert_candidate_id TEXT,
+      scan_id TEXT,
+      scan_candidate_id TEXT,
+      observed_at TEXT NOT NULL,
+      side TEXT,
+      amount_usd REAL,
+      token_mcap_at_observation REAL,
+      token_price_at_observation REAL,
+      flow_quality TEXT,
+      wallet_quality TEXT,
+      buyer_seller_balance TEXT,
+      sell_pressure TEXT,
+      holder_risk TEXT,
+      cluster_risk TEXT,
+      raw_context TEXT,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS smart_wallet_profiles (
+      wallet_address TEXT PRIMARY KEY,
+      observed_tokens_count INTEGER NOT NULL DEFAULT 0,
+      observed_alert_tokens_count INTEGER NOT NULL DEFAULT 0,
+      avg_return_1h REAL,
+      avg_return_4h REAL,
+      avg_return_24h REAL,
+      avg_peak_return REAL,
+      hit_2x_count INTEGER NOT NULL DEFAULT 0,
+      hit_5x_count INTEGER NOT NULL DEFAULT 0,
+      hit_10x_count INTEGER NOT NULL DEFAULT 0,
+      early_entry_count INTEGER NOT NULL DEFAULT 0,
+      bad_result_count INTEGER NOT NULL DEFAULT 0,
+      bot_like_count INTEGER NOT NULL DEFAULT 0,
+      high_risk_count INTEGER NOT NULL DEFAULT 0,
+      last_seen_at TEXT,
+      last_updated_at TEXT NOT NULL,
+      wallet_quality_score REAL NOT NULL DEFAULT 0,
+      wallet_quality_label TEXT NOT NULL DEFAULT 'Unknown',
+      raw_stats TEXT
     );
 
     CREATE TABLE IF NOT EXISTS learning_summaries (
@@ -495,6 +585,16 @@ function runSchema(db: SqliteDatabase): void {
       sell_pressure TEXT,
       wallet_quality TEXT,
       cluster_risk TEXT,
+      smart_wallet_quality_score REAL,
+      smart_wallet_quality_label TEXT,
+      strong_wallet_count INTEGER,
+      medium_wallet_count INTEGER,
+      weak_wallet_count INTEGER,
+      known_wallet_count INTEGER,
+      wallet_pdca_summary TEXT,
+      auto_tuning_adjustment REAL,
+      auto_tuning_reasons TEXT,
+      auto_tuning_version TEXT,
       quality_gate_grade TEXT,
       quality_gate_reasons TEXT,
       quality_gate_warnings TEXT,
@@ -515,6 +615,7 @@ function runSchema(db: SqliteDatabase): void {
 
     CREATE TABLE IF NOT EXISTS alert_performance_snapshots (
       id TEXT PRIMARY KEY,
+      alert_candidate_id TEXT,
       alert_run_id TEXT NOT NULL,
       token_address TEXT NOT NULL,
       snapshot_label TEXT NOT NULL,
@@ -529,6 +630,7 @@ function runSchema(db: SqliteDatabase): void {
 
     CREATE TABLE IF NOT EXISTS alert_peak_performance (
       id TEXT PRIMARY KEY,
+      alert_candidate_id TEXT,
       alert_run_id TEXT NOT NULL,
       token_address TEXT NOT NULL,
       entry_mcap REAL,
@@ -543,6 +645,7 @@ function runSchema(db: SqliteDatabase): void {
 
     CREATE TABLE IF NOT EXISTS alert_pump_notifications (
       notification_id TEXT PRIMARY KEY,
+      alert_candidate_id TEXT,
       alert_run_id TEXT NOT NULL,
       token_address TEXT NOT NULL,
       threshold_x REAL NOT NULL,
@@ -554,7 +657,7 @@ function runSchema(db: SqliteDatabase): void {
       channel_id TEXT,
       message_id TEXT,
       notified_at TEXT NOT NULL,
-      UNIQUE(token_address, threshold_x)
+      UNIQUE(alert_candidate_id, threshold_x)
     );
 
     CREATE TABLE IF NOT EXISTS optimization_suggestions (
@@ -572,6 +675,24 @@ function runSchema(db: SqliteDatabase): void {
       risk_note TEXT,
       status TEXT,
       linked_experiment_id TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS auto_tuning_results (
+      auto_tuning_run_id TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      sample_size INTEGER NOT NULL,
+      data_window_hours INTEGER NOT NULL,
+      bucket_type TEXT NOT NULL,
+      bucket_name TEXT NOT NULL,
+      avg_peak_return REAL,
+      hit_2x_rate REAL,
+      hit_5x_rate REAL,
+      bad_result_rate REAL,
+      best_peak_return REAL,
+      adjustment REAL NOT NULL,
+      reason TEXT,
+      version TEXT NOT NULL,
+      PRIMARY KEY(auto_tuning_run_id, bucket_type, bucket_name)
     );
 
     CREATE TABLE IF NOT EXISTS optimization_experiments (
@@ -632,6 +753,12 @@ function runSchema(db: SqliteDatabase): void {
     CREATE INDEX IF NOT EXISTS idx_alert_candidates_created_at ON alert_candidates(created_at);
     CREATE INDEX IF NOT EXISTS idx_alert_candidates_posted ON alert_candidates(posted);
     CREATE INDEX IF NOT EXISTS idx_alert_snapshots_run_token ON alert_performance_snapshots(alert_run_id, token_address);
+    CREATE INDEX IF NOT EXISTS idx_auto_tuning_results_version_created ON auto_tuning_results(version, created_at);
+    CREATE INDEX IF NOT EXISTS idx_smart_wallet_obs_wallet ON smart_wallet_observations(wallet_address);
+    CREATE INDEX IF NOT EXISTS idx_smart_wallet_obs_token ON smart_wallet_observations(token_address);
+    CREATE INDEX IF NOT EXISTS idx_smart_wallet_obs_alert_run ON smart_wallet_observations(alert_run_id);
+    CREATE INDEX IF NOT EXISTS idx_smart_wallet_obs_scan ON smart_wallet_observations(scan_id);
+    CREATE INDEX IF NOT EXISTS idx_smart_wallet_obs_created_at ON smart_wallet_observations(created_at);
   `);
 
   // 既存DBにもResearch Cardの元メッセージ情報を後付けします。
@@ -704,6 +831,105 @@ function runSchema(db: SqliteDatabase): void {
   ensureColumn(db, "alert_candidates", "volume_24h", "REAL");
   ensureColumn(db, "alert_candidates", "market_data_source", "TEXT");
   ensureColumn(db, "alert_candidates", "market_data_warning", "TEXT");
+  ensureColumn(db, "alert_candidates", "smart_wallet_quality_score", "REAL");
+  ensureColumn(db, "alert_candidates", "smart_wallet_quality_label", "TEXT");
+  ensureColumn(db, "alert_candidates", "strong_wallet_count", "INTEGER");
+  ensureColumn(db, "alert_candidates", "medium_wallet_count", "INTEGER");
+  ensureColumn(db, "alert_candidates", "weak_wallet_count", "INTEGER");
+  ensureColumn(db, "alert_candidates", "known_wallet_count", "INTEGER");
+  ensureColumn(db, "alert_candidates", "wallet_pdca_summary", "TEXT");
+  ensureColumn(db, "alert_candidates", "auto_tuning_adjustment", "REAL");
+  ensureColumn(db, "alert_candidates", "auto_tuning_reasons", "TEXT");
+  ensureColumn(db, "alert_candidates", "auto_tuning_version", "TEXT");
+  ensureColumn(db, "alert_performance_snapshots", "alert_candidate_id", "TEXT");
+  ensureColumn(db, "alert_peak_performance", "alert_candidate_id", "TEXT");
+  ensureColumn(db, "alert_pump_notifications", "alert_candidate_id", "TEXT");
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS alert_pump_notifications_v2 (
+      notification_id TEXT PRIMARY KEY,
+      alert_candidate_id TEXT,
+      alert_run_id TEXT NOT NULL,
+      token_address TEXT NOT NULL,
+      threshold_x REAL NOT NULL,
+      return_x REAL,
+      entry_mcap REAL,
+      peak_mcap REAL,
+      time_to_peak_hours REAL,
+      snapshot_label TEXT,
+      channel_id TEXT,
+      message_id TEXT,
+      notified_at TEXT NOT NULL,
+      UNIQUE(alert_candidate_id, threshold_x)
+    );
+    INSERT OR IGNORE INTO alert_pump_notifications_v2 (
+      notification_id, alert_candidate_id, alert_run_id, token_address, threshold_x,
+      return_x, entry_mcap, peak_mcap, time_to_peak_hours, snapshot_label,
+      channel_id, message_id, notified_at
+    )
+    SELECT
+      notification_id, alert_candidate_id, alert_run_id, token_address, threshold_x,
+      return_x, entry_mcap, peak_mcap, time_to_peak_hours, snapshot_label,
+      channel_id, message_id, notified_at
+    FROM alert_pump_notifications;
+    DROP TABLE alert_pump_notifications;
+    ALTER TABLE alert_pump_notifications_v2 RENAME TO alert_pump_notifications;
+
+    CREATE INDEX IF NOT EXISTS idx_alert_snapshots_candidate_id ON alert_performance_snapshots(alert_candidate_id);
+    CREATE INDEX IF NOT EXISTS idx_alert_peak_candidate_id ON alert_peak_performance(alert_candidate_id);
+    CREATE INDEX IF NOT EXISTS idx_alert_pump_candidate_id ON alert_pump_notifications(alert_candidate_id);
+
+    UPDATE alert_performance_snapshots
+    SET alert_candidate_id = (
+      SELECT ac.id
+      FROM alert_candidates ac
+      WHERE ac.posted = 1
+        AND ac.token_address = alert_performance_snapshots.token_address
+        AND (
+          ac.alert_run_id = alert_performance_snapshots.alert_run_id
+          OR ac.created_at <= alert_performance_snapshots.created_at
+        )
+      ORDER BY
+        CASE WHEN ac.alert_run_id = alert_performance_snapshots.alert_run_id THEN 0 ELSE 1 END,
+        ABS(strftime('%s', alert_performance_snapshots.created_at) - strftime('%s', ac.created_at))
+      LIMIT 1
+    )
+    WHERE alert_candidate_id IS NULL;
+
+    UPDATE alert_peak_performance
+    SET alert_candidate_id = (
+      SELECT ac.id
+      FROM alert_candidates ac
+      WHERE ac.posted = 1
+        AND ac.token_address = alert_peak_performance.token_address
+        AND (
+          ac.alert_run_id = alert_peak_performance.alert_run_id
+          OR ac.created_at <= alert_peak_performance.updated_at
+        )
+      ORDER BY
+        CASE WHEN ac.alert_run_id = alert_peak_performance.alert_run_id THEN 0 ELSE 1 END,
+        ABS(strftime('%s', alert_peak_performance.updated_at) - strftime('%s', ac.created_at))
+      LIMIT 1
+    )
+    WHERE alert_candidate_id IS NULL;
+
+    UPDATE alert_pump_notifications
+    SET alert_candidate_id = (
+      SELECT ac.id
+      FROM alert_candidates ac
+      WHERE ac.posted = 1
+        AND ac.token_address = alert_pump_notifications.token_address
+        AND (
+          ac.alert_run_id = alert_pump_notifications.alert_run_id
+          OR ac.created_at <= alert_pump_notifications.notified_at
+        )
+      ORDER BY
+        CASE WHEN ac.alert_run_id = alert_pump_notifications.alert_run_id THEN 0 ELSE 1 END,
+        ABS(strftime('%s', alert_pump_notifications.notified_at) - strftime('%s', ac.created_at))
+      LIMIT 1
+    )
+    WHERE alert_candidate_id IS NULL;
+  `);
 }
 
 function buildFreshScanSqliteStore(db: SqliteDatabase) {
@@ -808,6 +1034,11 @@ function buildFreshScanSqliteStore(db: SqliteDatabase) {
         best_snapshot_label: snapshot.snapshot_label,
         updated_at: snapshot.created_at,
       });
+      upsertSmartWalletProfilesSqlite(db, aggregateSmartWalletProfilesSqlite(db));
+      return Promise.resolve();
+    },
+    refreshSmartWalletProfiles(): Promise<void> {
+      upsertSmartWalletProfilesSqlite(db, aggregateSmartWalletProfilesSqlite(db));
       return Promise.resolve();
     },
     close(): Promise<void> {
@@ -870,6 +1101,16 @@ const alertCandidateColumns = [
   "sell_pressure",
   "wallet_quality",
   "cluster_risk",
+  "smart_wallet_quality_score",
+  "smart_wallet_quality_label",
+  "strong_wallet_count",
+  "medium_wallet_count",
+  "weak_wallet_count",
+  "known_wallet_count",
+  "wallet_pdca_summary",
+  "auto_tuning_adjustment",
+  "auto_tuning_reasons",
+  "auto_tuning_version",
   "quality_gate_grade",
   "quality_gate_reasons",
   "quality_gate_warnings",
@@ -889,6 +1130,7 @@ const alertCandidateColumns = [
 ] as const;
 
 type AlertSnapshotRecord = {
+  alert_candidate_id?: string | null;
   alert_run_id: string;
   token_address: string;
   snapshot_label: string;
@@ -906,7 +1148,327 @@ function snapshotLabelToHours(label: string): number {
   return Number(label.replace("h", "").replace("d", "")) * (label.endsWith("d") ? 24 : 1);
 }
 
+function clampScore(value: number, min = 0, max = 100): number {
+  return Math.max(min, Math.min(max, Math.round(value)));
+}
+
+function calculateWalletProfileQuality(row: SmartWalletProfileAggregateRow): { score: number; label: string; rawStats: string } {
+  const observedCount = Number(row.observed_tokens_count) || 0;
+  const hit2x = Number(row.hit_2x_count) || 0;
+  const hit5x = Number(row.hit_5x_count) || 0;
+  const hit10x = Number(row.hit_10x_count) || 0;
+  const bad = Number(row.bad_result_count) || 0;
+  const botLike = Number(row.bot_like_count) || 0;
+  const highRisk = Number(row.high_risk_count) || 0;
+  const avgPeak = row.avg_peak_return ?? null;
+
+  if (observedCount < 3) {
+    return {
+      score: 0,
+      label: "Unknown",
+      rawStats: JSON.stringify({ ...row, reason: "observed_tokens_count < 3" }),
+    };
+  }
+
+  const confidence = Math.min(1, observedCount / 10);
+  const hit2Rate = hit2x / observedCount;
+  const hit5Rate = hit5x / observedCount;
+  const badRate = bad / observedCount;
+  let score = 35;
+
+  score += hit2Rate * 28;
+  score += hit5Rate * 32;
+  score += hit10x * 4;
+  score += Math.min(18, Math.max(0, ((avgPeak ?? 1) - 1) * 7));
+  score += confidence * 12;
+  score -= badRate * 30;
+  score -= Math.min(20, botLike * 5);
+  score -= Math.min(22, highRisk * 6);
+  score = 35 + (score - 35) * confidence;
+
+  const clamped = clampScore(score);
+  const label = clamped >= 75 ? "Strong" : clamped >= 50 ? "Medium" : "Weak";
+
+  return {
+    score: clamped,
+    label,
+    rawStats: JSON.stringify({
+      ...row,
+      confidence,
+      hit_2x_rate: hit2Rate,
+      hit_5x_rate: hit5Rate,
+      bad_result_rate: badRate,
+      scoring_version: "smart-wallet-pdca-v1",
+    }),
+  };
+}
+
+function aggregateSmartWalletProfilesSqlite(db: SqliteDatabase): SmartWalletProfileAggregateRow[] {
+  return db.prepare(`
+    WITH observed_tokens AS (
+      SELECT
+        wallet_address,
+        token_address,
+        MAX(CASE WHEN source_type = 'alert' THEN 1 ELSE 0 END) AS is_alert_token,
+        MIN(token_mcap_at_observation) AS first_mcap,
+        MAX(CASE WHEN cluster_risk = 'High' OR sell_pressure = 'High' OR holder_risk = 'High' THEN 1 ELSE 0 END) AS high_risk_seen,
+        MAX(CASE WHEN wallet_quality = 'Low' OR cluster_risk IN ('High', 'Medium') THEN 1 ELSE 0 END) AS bot_like_seen,
+        MAX(observed_at) AS last_seen_at
+      FROM smart_wallet_observations
+      GROUP BY wallet_address, token_address
+    ),
+    snapshot_returns AS (
+      SELECT token_address, snapshot_label, MAX(return_x) AS return_x
+      FROM candidate_performance_snapshots
+      WHERE return_x IS NOT NULL
+      GROUP BY token_address, snapshot_label
+      UNION ALL
+      SELECT token_address, snapshot_label, MAX(return_x) AS return_x
+      FROM alert_performance_snapshots
+      WHERE return_x IS NOT NULL
+      GROUP BY token_address, snapshot_label
+    ),
+    token_returns AS (
+      SELECT
+        token_address,
+        MAX(CASE WHEN snapshot_label = '1h' THEN return_x END) AS return_1h,
+        MAX(CASE WHEN snapshot_label = '4h' THEN return_x END) AS return_4h,
+        MAX(CASE WHEN snapshot_label = '24h' THEN return_x END) AS return_24h
+      FROM snapshot_returns
+      GROUP BY token_address
+    ),
+    token_peaks AS (
+      SELECT token_address, MAX(peak_return_x) AS peak_return_x
+      FROM (
+        SELECT token_address, peak_return_x FROM candidate_peak_performance WHERE peak_return_x IS NOT NULL
+        UNION ALL
+        SELECT token_address, peak_return_x FROM alert_peak_performance WHERE peak_return_x IS NOT NULL
+      )
+      GROUP BY token_address
+    )
+    SELECT
+      ot.wallet_address,
+      COUNT(*) AS observed_tokens_count,
+      SUM(ot.is_alert_token) AS observed_alert_tokens_count,
+      AVG(tr.return_1h) AS avg_return_1h,
+      AVG(tr.return_4h) AS avg_return_4h,
+      AVG(tr.return_24h) AS avg_return_24h,
+      AVG(tp.peak_return_x) AS avg_peak_return,
+      SUM(CASE WHEN COALESCE(tp.peak_return_x, 0) >= 2.0 THEN 1 ELSE 0 END) AS hit_2x_count,
+      SUM(CASE WHEN COALESCE(tp.peak_return_x, 0) >= 5.0 THEN 1 ELSE 0 END) AS hit_5x_count,
+      SUM(CASE WHEN COALESCE(tp.peak_return_x, 0) >= 10.0 THEN 1 ELSE 0 END) AS hit_10x_count,
+      SUM(CASE WHEN ot.first_mcap IS NOT NULL AND ot.first_mcap < 500000 THEN 1 ELSE 0 END) AS early_entry_count,
+      SUM(CASE WHEN tp.peak_return_x IS NOT NULL AND tp.peak_return_x < 0.7 THEN 1 ELSE 0 END) AS bad_result_count,
+      SUM(ot.bot_like_seen) AS bot_like_count,
+      SUM(ot.high_risk_seen) AS high_risk_count,
+      MAX(ot.last_seen_at) AS last_seen_at
+    FROM observed_tokens ot
+    LEFT JOIN token_returns tr ON tr.token_address = ot.token_address
+    LEFT JOIN token_peaks tp ON tp.token_address = ot.token_address
+    GROUP BY ot.wallet_address
+  `).all() as SmartWalletProfileAggregateRow[];
+}
+
+function upsertSmartWalletProfilesSqlite(db: SqliteDatabase, rows: SmartWalletProfileAggregateRow[]): void {
+  const now = new Date().toISOString();
+  const upsert = db.prepare(`
+    INSERT INTO smart_wallet_profiles (
+      wallet_address, observed_tokens_count, observed_alert_tokens_count,
+      avg_return_1h, avg_return_4h, avg_return_24h, avg_peak_return,
+      hit_2x_count, hit_5x_count, hit_10x_count, early_entry_count,
+      bad_result_count, bot_like_count, high_risk_count, last_seen_at,
+      last_updated_at, wallet_quality_score, wallet_quality_label, raw_stats
+    ) VALUES (
+      @wallet_address, @observed_tokens_count, @observed_alert_tokens_count,
+      @avg_return_1h, @avg_return_4h, @avg_return_24h, @avg_peak_return,
+      @hit_2x_count, @hit_5x_count, @hit_10x_count, @early_entry_count,
+      @bad_result_count, @bot_like_count, @high_risk_count, @last_seen_at,
+      @last_updated_at, @wallet_quality_score, @wallet_quality_label, @raw_stats
+    )
+    ON CONFLICT(wallet_address) DO UPDATE SET
+      observed_tokens_count = excluded.observed_tokens_count,
+      observed_alert_tokens_count = excluded.observed_alert_tokens_count,
+      avg_return_1h = excluded.avg_return_1h,
+      avg_return_4h = excluded.avg_return_4h,
+      avg_return_24h = excluded.avg_return_24h,
+      avg_peak_return = excluded.avg_peak_return,
+      hit_2x_count = excluded.hit_2x_count,
+      hit_5x_count = excluded.hit_5x_count,
+      hit_10x_count = excluded.hit_10x_count,
+      early_entry_count = excluded.early_entry_count,
+      bad_result_count = excluded.bad_result_count,
+      bot_like_count = excluded.bot_like_count,
+      high_risk_count = excluded.high_risk_count,
+      last_seen_at = excluded.last_seen_at,
+      last_updated_at = excluded.last_updated_at,
+      wallet_quality_score = excluded.wallet_quality_score,
+      wallet_quality_label = excluded.wallet_quality_label,
+      raw_stats = excluded.raw_stats
+  `);
+  const write = db.transaction((items: SmartWalletProfileAggregateRow[]) => {
+    for (const row of items) {
+      const quality = calculateWalletProfileQuality(row);
+
+      upsert.run({
+        ...row,
+        last_updated_at: now,
+        wallet_quality_score: quality.score,
+        wallet_quality_label: quality.label,
+        raw_stats: quality.rawStats,
+      });
+    }
+  });
+
+  write(rows);
+}
+
+async function aggregateSmartWalletProfilesPostgres(
+  pool: { query: (text: string, params?: unknown[]) => Promise<{ rows?: unknown[] } | unknown> },
+): Promise<SmartWalletProfileAggregateRow[]> {
+  const result = await pool.query(`
+    WITH observed_tokens AS (
+      SELECT
+        wallet_address,
+        token_address,
+        MAX(CASE WHEN source_type = 'alert' THEN 1 ELSE 0 END) AS is_alert_token,
+        MIN(token_mcap_at_observation) AS first_mcap,
+        MAX(CASE WHEN cluster_risk = 'High' OR sell_pressure = 'High' OR holder_risk = 'High' THEN 1 ELSE 0 END) AS high_risk_seen,
+        MAX(CASE WHEN wallet_quality = 'Low' OR cluster_risk IN ('High', 'Medium') THEN 1 ELSE 0 END) AS bot_like_seen,
+        MAX(observed_at) AS last_seen_at
+      FROM smart_wallet_observations
+      GROUP BY wallet_address, token_address
+    ),
+    snapshot_returns AS (
+      SELECT token_address, snapshot_label, MAX(return_x) AS return_x
+      FROM candidate_performance_snapshots
+      WHERE return_x IS NOT NULL
+      GROUP BY token_address, snapshot_label
+      UNION ALL
+      SELECT token_address, snapshot_label, MAX(return_x) AS return_x
+      FROM alert_performance_snapshots
+      WHERE return_x IS NOT NULL
+      GROUP BY token_address, snapshot_label
+    ),
+    token_returns AS (
+      SELECT
+        token_address,
+        MAX(CASE WHEN snapshot_label = '1h' THEN return_x END) AS return_1h,
+        MAX(CASE WHEN snapshot_label = '4h' THEN return_x END) AS return_4h,
+        MAX(CASE WHEN snapshot_label = '24h' THEN return_x END) AS return_24h
+      FROM snapshot_returns
+      GROUP BY token_address
+    ),
+    token_peaks AS (
+      SELECT token_address, MAX(peak_return_x) AS peak_return_x
+      FROM (
+        SELECT token_address, peak_return_x FROM candidate_peak_performance WHERE peak_return_x IS NOT NULL
+        UNION ALL
+        SELECT token_address, peak_return_x FROM alert_peak_performance WHERE peak_return_x IS NOT NULL
+      ) peaks
+      GROUP BY token_address
+    )
+    SELECT
+      ot.wallet_address,
+      COUNT(*)::int AS observed_tokens_count,
+      COALESCE(SUM(ot.is_alert_token), 0)::int AS observed_alert_tokens_count,
+      AVG(tr.return_1h) AS avg_return_1h,
+      AVG(tr.return_4h) AS avg_return_4h,
+      AVG(tr.return_24h) AS avg_return_24h,
+      AVG(tp.peak_return_x) AS avg_peak_return,
+      COALESCE(SUM(CASE WHEN COALESCE(tp.peak_return_x, 0) >= 2.0 THEN 1 ELSE 0 END), 0)::int AS hit_2x_count,
+      COALESCE(SUM(CASE WHEN COALESCE(tp.peak_return_x, 0) >= 5.0 THEN 1 ELSE 0 END), 0)::int AS hit_5x_count,
+      COALESCE(SUM(CASE WHEN COALESCE(tp.peak_return_x, 0) >= 10.0 THEN 1 ELSE 0 END), 0)::int AS hit_10x_count,
+      COALESCE(SUM(CASE WHEN ot.first_mcap IS NOT NULL AND ot.first_mcap < 500000 THEN 1 ELSE 0 END), 0)::int AS early_entry_count,
+      COALESCE(SUM(CASE WHEN tp.peak_return_x IS NOT NULL AND tp.peak_return_x < 0.7 THEN 1 ELSE 0 END), 0)::int AS bad_result_count,
+      COALESCE(SUM(ot.bot_like_seen), 0)::int AS bot_like_count,
+      COALESCE(SUM(ot.high_risk_seen), 0)::int AS high_risk_count,
+      MAX(ot.last_seen_at)::text AS last_seen_at
+    FROM observed_tokens ot
+    LEFT JOIN token_returns tr ON tr.token_address = ot.token_address
+    LEFT JOIN token_peaks tp ON tp.token_address = ot.token_address
+    GROUP BY ot.wallet_address
+  `);
+
+  return ((result as { rows?: unknown[] }).rows ?? []) as SmartWalletProfileAggregateRow[];
+}
+
+async function refreshSmartWalletProfilesPostgres(
+  pool: { query: (text: string, params?: unknown[]) => Promise<unknown> },
+): Promise<void> {
+  const rows = await aggregateSmartWalletProfilesPostgres(pool);
+  const now = new Date().toISOString();
+
+  for (const row of rows) {
+    const quality = calculateWalletProfileQuality(row);
+
+    await pool.query(
+      `INSERT INTO smart_wallet_profiles (
+        wallet_address, observed_tokens_count, observed_alert_tokens_count,
+        avg_return_1h, avg_return_4h, avg_return_24h, avg_peak_return,
+        hit_2x_count, hit_5x_count, hit_10x_count, early_entry_count,
+        bad_result_count, bot_like_count, high_risk_count, last_seen_at,
+        last_updated_at, wallet_quality_score, wallet_quality_label, raw_stats
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19::jsonb)
+      ON CONFLICT(wallet_address) DO UPDATE SET
+        observed_tokens_count = excluded.observed_tokens_count,
+        observed_alert_tokens_count = excluded.observed_alert_tokens_count,
+        avg_return_1h = excluded.avg_return_1h,
+        avg_return_4h = excluded.avg_return_4h,
+        avg_return_24h = excluded.avg_return_24h,
+        avg_peak_return = excluded.avg_peak_return,
+        hit_2x_count = excluded.hit_2x_count,
+        hit_5x_count = excluded.hit_5x_count,
+        hit_10x_count = excluded.hit_10x_count,
+        early_entry_count = excluded.early_entry_count,
+        bad_result_count = excluded.bad_result_count,
+        bot_like_count = excluded.bot_like_count,
+        high_risk_count = excluded.high_risk_count,
+        last_seen_at = excluded.last_seen_at,
+        last_updated_at = excluded.last_updated_at,
+        wallet_quality_score = excluded.wallet_quality_score,
+        wallet_quality_label = excluded.wallet_quality_label,
+        raw_stats = excluded.raw_stats`,
+      [
+        row.wallet_address,
+        row.observed_tokens_count,
+        row.observed_alert_tokens_count,
+        row.avg_return_1h,
+        row.avg_return_4h,
+        row.avg_return_24h,
+        row.avg_peak_return,
+        row.hit_2x_count,
+        row.hit_5x_count,
+        row.hit_10x_count,
+        row.early_entry_count,
+        row.bad_result_count,
+        row.bot_like_count,
+        row.high_risk_count,
+        row.last_seen_at,
+        now,
+        quality.score,
+        quality.label,
+        quality.rawStats,
+      ],
+    );
+  }
+}
+
 function buildAlertSqliteStore(db: SqliteDatabase) {
+  const insertSmartWalletObservation = db.prepare(`
+    INSERT OR IGNORE INTO smart_wallet_observations (
+      id, wallet_address, token_address, symbol, source_type, alert_run_id,
+      alert_candidate_id, scan_id, scan_candidate_id, observed_at, side,
+      amount_usd, token_mcap_at_observation, token_price_at_observation,
+      flow_quality, wallet_quality, buyer_seller_balance, sell_pressure,
+      holder_risk, cluster_risk, raw_context, created_at
+    ) VALUES (
+      @id, @wallet_address, @token_address, @symbol, @source_type, @alert_run_id,
+      @alert_candidate_id, @scan_id, @scan_candidate_id, @observed_at, @side,
+      @amount_usd, @token_mcap_at_observation, @token_price_at_observation,
+      @flow_quality, @wallet_quality, @buyer_seller_balance, @sell_pressure,
+      @holder_risk, @cluster_risk, @raw_context, @created_at
+    )
+  `);
   const insertRun = db.prepare(`
     INSERT INTO alert_runs (
       alert_run_id, started_at, finished_at, candidate_pool_size, nansen_candidate_size,
@@ -939,22 +1501,23 @@ function buildAlertSqliteStore(db: SqliteDatabase) {
   });
   const insertSnapshot = db.prepare(`
     INSERT INTO alert_performance_snapshots (
-      id, alert_run_id, token_address, snapshot_label, snapshot_time, mcap, price,
+      id, alert_candidate_id, alert_run_id, token_address, snapshot_label, snapshot_time, mcap, price,
       liquidity, volume_24h, return_x, created_at
     ) VALUES (
-      @id, @alert_run_id, @token_address, @snapshot_label, @snapshot_time, @mcap, @price,
+      @id, @alert_candidate_id, @alert_run_id, @token_address, @snapshot_label, @snapshot_time, @mcap, @price,
       @liquidity, @volume_24h, @return_x, @created_at
     )
   `);
   const upsertPeak = db.prepare(`
     INSERT INTO alert_peak_performance (
-      id, alert_run_id, token_address, entry_mcap, peak_mcap, peak_return_x,
+      id, alert_candidate_id, alert_run_id, token_address, entry_mcap, peak_mcap, peak_return_x,
       time_to_peak_hours, drawdown_after_peak, best_snapshot_label, updated_at
     ) VALUES (
-      @id, @alert_run_id, @token_address, @entry_mcap, @peak_mcap, @peak_return_x,
+      @id, @alert_candidate_id, @alert_run_id, @token_address, @entry_mcap, @peak_mcap, @peak_return_x,
       @time_to_peak_hours, NULL, @best_snapshot_label, @updated_at
     )
     ON CONFLICT(alert_run_id, token_address) DO UPDATE SET
+      alert_candidate_id = COALESCE(alert_peak_performance.alert_candidate_id, excluded.alert_candidate_id),
       peak_mcap = CASE
         WHEN excluded.peak_return_x > COALESCE(alert_peak_performance.peak_return_x, 0)
         THEN excluded.peak_mcap ELSE alert_peak_performance.peak_mcap END,
@@ -976,10 +1539,31 @@ function buildAlertSqliteStore(db: SqliteDatabase) {
       saveCandidates(run, candidates);
       return Promise.resolve();
     },
+    saveSmartWalletObservations(observations: SmartWalletObservationRecord[]): Promise<void> {
+      const write = db.transaction((items: SmartWalletObservationRecord[]) => {
+        for (const observation of items) {
+          insertSmartWalletObservation.run(observation);
+        }
+      });
+
+      write(observations);
+      upsertSmartWalletProfilesSqlite(db, aggregateSmartWalletProfilesSqlite(db));
+      return Promise.resolve();
+    },
+    refreshSmartWalletProfiles(): Promise<void> {
+      upsertSmartWalletProfilesSqlite(db, aggregateSmartWalletProfilesSqlite(db));
+      return Promise.resolve();
+    },
     savePerformanceSnapshot(snapshot: AlertSnapshotRecord): Promise<void> {
-      insertSnapshot.run({ id: `${snapshot.alert_run_id}:${snapshot.token_address}:${snapshot.snapshot_label}`, ...snapshot });
+      const alertCandidateId = snapshot.alert_candidate_id ?? `${snapshot.alert_run_id}:${snapshot.token_address}`;
+      insertSnapshot.run({
+        id: `${alertCandidateId}:${snapshot.snapshot_label}`,
+        alert_candidate_id: snapshot.alert_candidate_id ?? null,
+        ...snapshot,
+      });
       upsertPeak.run({
-        id: `${snapshot.alert_run_id}:${snapshot.token_address}:peak`,
+        id: `${alertCandidateId}:peak`,
+        alert_candidate_id: snapshot.alert_candidate_id ?? null,
         alert_run_id: snapshot.alert_run_id,
         token_address: snapshot.token_address,
         entry_mcap: snapshot.entry_mcap,
@@ -989,6 +1573,7 @@ function buildAlertSqliteStore(db: SqliteDatabase) {
         best_snapshot_label: snapshot.snapshot_label,
         updated_at: snapshot.created_at,
       });
+      upsertSmartWalletProfilesSqlite(db, aggregateSmartWalletProfilesSqlite(db));
       return Promise.resolve();
     },
   };
@@ -1106,6 +1691,51 @@ function buildFreshScanPostgresStore(databaseUrl: string) {
         updated_at TIMESTAMPTZ NOT NULL,
         UNIQUE(scan_id, token_address)
       );
+      CREATE TABLE IF NOT EXISTS smart_wallet_observations (
+        id TEXT PRIMARY KEY,
+        wallet_address TEXT NOT NULL,
+        token_address TEXT NOT NULL,
+        symbol TEXT,
+        source_type TEXT NOT NULL,
+        alert_run_id TEXT,
+        alert_candidate_id TEXT,
+        scan_id TEXT,
+        scan_candidate_id TEXT,
+        observed_at TIMESTAMPTZ NOT NULL,
+        side TEXT,
+        amount_usd DOUBLE PRECISION,
+        token_mcap_at_observation DOUBLE PRECISION,
+        token_price_at_observation DOUBLE PRECISION,
+        flow_quality TEXT,
+        wallet_quality TEXT,
+        buyer_seller_balance TEXT,
+        sell_pressure TEXT,
+        holder_risk TEXT,
+        cluster_risk TEXT,
+        raw_context JSONB,
+        created_at TIMESTAMPTZ NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS smart_wallet_profiles (
+        wallet_address TEXT PRIMARY KEY,
+        observed_tokens_count INTEGER NOT NULL DEFAULT 0,
+        observed_alert_tokens_count INTEGER NOT NULL DEFAULT 0,
+        avg_return_1h DOUBLE PRECISION,
+        avg_return_4h DOUBLE PRECISION,
+        avg_return_24h DOUBLE PRECISION,
+        avg_peak_return DOUBLE PRECISION,
+        hit_2x_count INTEGER NOT NULL DEFAULT 0,
+        hit_5x_count INTEGER NOT NULL DEFAULT 0,
+        hit_10x_count INTEGER NOT NULL DEFAULT 0,
+        early_entry_count INTEGER NOT NULL DEFAULT 0,
+        bad_result_count INTEGER NOT NULL DEFAULT 0,
+        bot_like_count INTEGER NOT NULL DEFAULT 0,
+        high_risk_count INTEGER NOT NULL DEFAULT 0,
+        last_seen_at TIMESTAMPTZ,
+        last_updated_at TIMESTAMPTZ NOT NULL,
+        wallet_quality_score DOUBLE PRECISION NOT NULL DEFAULT 0,
+        wallet_quality_label TEXT NOT NULL DEFAULT 'Unknown',
+        raw_stats JSONB
+      );
       ALTER TABLE scan_runs ADD COLUMN IF NOT EXISTS requested_candidate_pool_size INTEGER;
       ALTER TABLE scan_runs ADD COLUMN IF NOT EXISTS actual_candidate_pool_size INTEGER;
       ALTER TABLE scan_runs ADD COLUMN IF NOT EXISTS nansen_page_limit INTEGER;
@@ -1126,6 +1756,53 @@ function buildFreshScanPostgresStore(databaseUrl: string) {
       CREATE INDEX IF NOT EXISTS idx_candidate_snapshots_scan_token ON candidate_performance_snapshots(scan_id, token_address);
       CREATE INDEX IF NOT EXISTS idx_candidate_snapshots_label ON candidate_performance_snapshots(snapshot_label);
       CREATE INDEX IF NOT EXISTS idx_candidate_peak_scan_token ON candidate_peak_performance(scan_id, token_address);
+      CREATE INDEX IF NOT EXISTS idx_smart_wallet_obs_wallet ON smart_wallet_observations(wallet_address);
+      CREATE INDEX IF NOT EXISTS idx_smart_wallet_obs_token ON smart_wallet_observations(token_address);
+      CREATE INDEX IF NOT EXISTS idx_smart_wallet_obs_alert_run ON smart_wallet_observations(alert_run_id);
+      CREATE INDEX IF NOT EXISTS idx_smart_wallet_obs_scan ON smart_wallet_observations(scan_id);
+      CREATE INDEX IF NOT EXISTS idx_smart_wallet_obs_created_at ON smart_wallet_observations(created_at);
+
+      UPDATE alert_performance_snapshots aps
+      SET alert_candidate_id = (
+        SELECT id
+        FROM alert_candidates
+        WHERE posted = TRUE
+          AND token_address = aps.token_address
+          AND (alert_run_id = aps.alert_run_id OR created_at <= aps.created_at)
+        ORDER BY
+          CASE WHEN alert_run_id = aps.alert_run_id THEN 0 ELSE 1 END,
+          ABS(EXTRACT(EPOCH FROM (aps.created_at::timestamptz - created_at::timestamptz)))
+        LIMIT 1
+      )
+      WHERE aps.alert_candidate_id IS NULL;
+
+      UPDATE alert_peak_performance app
+      SET alert_candidate_id = (
+        SELECT id
+        FROM alert_candidates
+        WHERE posted = TRUE
+          AND token_address = app.token_address
+          AND (alert_run_id = app.alert_run_id OR created_at <= app.updated_at)
+        ORDER BY
+          CASE WHEN alert_run_id = app.alert_run_id THEN 0 ELSE 1 END,
+          ABS(EXTRACT(EPOCH FROM (app.updated_at::timestamptz - created_at::timestamptz)))
+        LIMIT 1
+      )
+      WHERE app.alert_candidate_id IS NULL;
+
+      UPDATE alert_pump_notifications apn
+      SET alert_candidate_id = (
+        SELECT id
+        FROM alert_candidates
+        WHERE posted = TRUE
+          AND token_address = apn.token_address
+          AND (alert_run_id = apn.alert_run_id OR created_at <= apn.notified_at)
+        ORDER BY
+          CASE WHEN alert_run_id = apn.alert_run_id THEN 0 ELSE 1 END,
+          ABS(EXTRACT(EPOCH FROM (apn.notified_at::timestamptz - created_at::timestamptz)))
+        LIMIT 1
+      )
+      WHERE apn.alert_candidate_id IS NULL;
     `).then(() => undefined).catch((error: unknown) => {
       const message = error instanceof Error ? error.message : "unknown error";
 
@@ -1312,6 +1989,13 @@ function buildFreshScanPostgresStore(databaseUrl: string) {
           snapshot.created_at,
         ],
       );
+      await refreshSmartWalletProfilesPostgres(pool);
+    },
+    async refreshSmartWalletProfiles(): Promise<void> {
+      if (!pool) return;
+
+      await ready;
+      await refreshSmartWalletProfilesPostgres(pool);
     },
     async close(): Promise<void> {
       await pool?.end();
@@ -1402,6 +2086,16 @@ function buildAlertPostgresStore(databaseUrl: string) {
         sell_pressure TEXT,
         wallet_quality TEXT,
         cluster_risk TEXT,
+        smart_wallet_quality_score DOUBLE PRECISION,
+        smart_wallet_quality_label TEXT,
+        strong_wallet_count INTEGER,
+        medium_wallet_count INTEGER,
+        weak_wallet_count INTEGER,
+        known_wallet_count INTEGER,
+        wallet_pdca_summary JSONB,
+        auto_tuning_adjustment DOUBLE PRECISION,
+        auto_tuning_reasons JSONB,
+        auto_tuning_version TEXT,
         quality_gate_grade TEXT,
         quality_gate_reasons JSONB,
         quality_gate_warnings JSONB,
@@ -1421,6 +2115,7 @@ function buildAlertPostgresStore(databaseUrl: string) {
       );
       CREATE TABLE IF NOT EXISTS alert_performance_snapshots (
         id TEXT PRIMARY KEY,
+        alert_candidate_id TEXT,
         alert_run_id TEXT NOT NULL,
         token_address TEXT NOT NULL,
         snapshot_label TEXT NOT NULL,
@@ -1434,6 +2129,7 @@ function buildAlertPostgresStore(databaseUrl: string) {
       );
       CREATE TABLE IF NOT EXISTS alert_peak_performance (
         id TEXT PRIMARY KEY,
+        alert_candidate_id TEXT,
         alert_run_id TEXT NOT NULL,
         token_address TEXT NOT NULL,
         entry_mcap DOUBLE PRECISION,
@@ -1447,6 +2143,7 @@ function buildAlertPostgresStore(databaseUrl: string) {
       );
       CREATE TABLE IF NOT EXISTS alert_pump_notifications (
         notification_id TEXT PRIMARY KEY,
+        alert_candidate_id TEXT,
         alert_run_id TEXT NOT NULL,
         token_address TEXT NOT NULL,
         threshold_x DOUBLE PRECISION NOT NULL,
@@ -1458,12 +2155,71 @@ function buildAlertPostgresStore(databaseUrl: string) {
         channel_id TEXT,
         message_id TEXT,
         notified_at TIMESTAMPTZ NOT NULL,
-        UNIQUE(token_address, threshold_x)
+        UNIQUE(alert_candidate_id, threshold_x)
       );
       ALTER TABLE alert_candidates ADD COLUMN IF NOT EXISTS price DOUBLE PRECISION;
       ALTER TABLE alert_candidates ADD COLUMN IF NOT EXISTS volume_24h DOUBLE PRECISION;
       ALTER TABLE alert_candidates ADD COLUMN IF NOT EXISTS market_data_source TEXT;
       ALTER TABLE alert_candidates ADD COLUMN IF NOT EXISTS market_data_warning TEXT;
+      ALTER TABLE alert_candidates ADD COLUMN IF NOT EXISTS smart_wallet_quality_score DOUBLE PRECISION;
+      ALTER TABLE alert_candidates ADD COLUMN IF NOT EXISTS smart_wallet_quality_label TEXT;
+      ALTER TABLE alert_candidates ADD COLUMN IF NOT EXISTS strong_wallet_count INTEGER;
+      ALTER TABLE alert_candidates ADD COLUMN IF NOT EXISTS medium_wallet_count INTEGER;
+      ALTER TABLE alert_candidates ADD COLUMN IF NOT EXISTS weak_wallet_count INTEGER;
+      ALTER TABLE alert_candidates ADD COLUMN IF NOT EXISTS known_wallet_count INTEGER;
+      ALTER TABLE alert_candidates ADD COLUMN IF NOT EXISTS wallet_pdca_summary JSONB;
+      ALTER TABLE alert_candidates ADD COLUMN IF NOT EXISTS auto_tuning_adjustment DOUBLE PRECISION;
+      ALTER TABLE alert_candidates ADD COLUMN IF NOT EXISTS auto_tuning_reasons JSONB;
+      ALTER TABLE alert_candidates ADD COLUMN IF NOT EXISTS auto_tuning_version TEXT;
+      ALTER TABLE alert_performance_snapshots ADD COLUMN IF NOT EXISTS alert_candidate_id TEXT;
+      ALTER TABLE alert_peak_performance ADD COLUMN IF NOT EXISTS alert_candidate_id TEXT;
+      ALTER TABLE alert_pump_notifications ADD COLUMN IF NOT EXISTS alert_candidate_id TEXT;
+      ALTER TABLE alert_pump_notifications DROP CONSTRAINT IF EXISTS alert_pump_notifications_token_address_threshold_x_key;
+      CREATE TABLE IF NOT EXISTS smart_wallet_observations (
+        id TEXT PRIMARY KEY,
+        wallet_address TEXT NOT NULL,
+        token_address TEXT NOT NULL,
+        symbol TEXT,
+        source_type TEXT NOT NULL,
+        alert_run_id TEXT,
+        alert_candidate_id TEXT,
+        scan_id TEXT,
+        scan_candidate_id TEXT,
+        observed_at TIMESTAMPTZ NOT NULL,
+        side TEXT,
+        amount_usd DOUBLE PRECISION,
+        token_mcap_at_observation DOUBLE PRECISION,
+        token_price_at_observation DOUBLE PRECISION,
+        flow_quality TEXT,
+        wallet_quality TEXT,
+        buyer_seller_balance TEXT,
+        sell_pressure TEXT,
+        holder_risk TEXT,
+        cluster_risk TEXT,
+        raw_context JSONB,
+        created_at TIMESTAMPTZ NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS smart_wallet_profiles (
+        wallet_address TEXT PRIMARY KEY,
+        observed_tokens_count INTEGER NOT NULL DEFAULT 0,
+        observed_alert_tokens_count INTEGER NOT NULL DEFAULT 0,
+        avg_return_1h DOUBLE PRECISION,
+        avg_return_4h DOUBLE PRECISION,
+        avg_return_24h DOUBLE PRECISION,
+        avg_peak_return DOUBLE PRECISION,
+        hit_2x_count INTEGER NOT NULL DEFAULT 0,
+        hit_5x_count INTEGER NOT NULL DEFAULT 0,
+        hit_10x_count INTEGER NOT NULL DEFAULT 0,
+        early_entry_count INTEGER NOT NULL DEFAULT 0,
+        bad_result_count INTEGER NOT NULL DEFAULT 0,
+        bot_like_count INTEGER NOT NULL DEFAULT 0,
+        high_risk_count INTEGER NOT NULL DEFAULT 0,
+        last_seen_at TIMESTAMPTZ,
+        last_updated_at TIMESTAMPTZ NOT NULL,
+        wallet_quality_score DOUBLE PRECISION NOT NULL DEFAULT 0,
+        wallet_quality_label TEXT NOT NULL DEFAULT 'Unknown',
+        raw_stats JSONB
+      );
       CREATE TABLE IF NOT EXISTS optimization_suggestions (
         suggestion_id TEXT PRIMARY KEY,
         created_at TIMESTAMPTZ NOT NULL,
@@ -1479,6 +2235,23 @@ function buildAlertPostgresStore(databaseUrl: string) {
         risk_note TEXT,
         status TEXT,
         linked_experiment_id TEXT
+      );
+      CREATE TABLE IF NOT EXISTS auto_tuning_results (
+        auto_tuning_run_id TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL,
+        sample_size INTEGER NOT NULL,
+        data_window_hours INTEGER NOT NULL,
+        bucket_type TEXT NOT NULL,
+        bucket_name TEXT NOT NULL,
+        avg_peak_return DOUBLE PRECISION,
+        hit_2x_rate DOUBLE PRECISION,
+        hit_5x_rate DOUBLE PRECISION,
+        bad_result_rate DOUBLE PRECISION,
+        best_peak_return DOUBLE PRECISION,
+        adjustment DOUBLE PRECISION NOT NULL,
+        reason TEXT,
+        version TEXT NOT NULL,
+        PRIMARY KEY(auto_tuning_run_id, bucket_type, bucket_name)
       );
       CREATE TABLE IF NOT EXISTS optimization_experiments (
         experiment_id TEXT PRIMARY KEY,
@@ -1528,6 +2301,16 @@ function buildAlertPostgresStore(databaseUrl: string) {
       CREATE INDEX IF NOT EXISTS idx_alert_candidates_created_at ON alert_candidates(created_at);
       CREATE INDEX IF NOT EXISTS idx_alert_candidates_posted ON alert_candidates(posted);
       CREATE INDEX IF NOT EXISTS idx_alert_snapshots_run_token ON alert_performance_snapshots(alert_run_id, token_address);
+      CREATE INDEX IF NOT EXISTS idx_alert_snapshots_candidate_id ON alert_performance_snapshots(alert_candidate_id);
+      CREATE INDEX IF NOT EXISTS idx_alert_peak_candidate_id ON alert_peak_performance(alert_candidate_id);
+      CREATE INDEX IF NOT EXISTS idx_alert_pump_candidate_id ON alert_pump_notifications(alert_candidate_id);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_alert_pump_candidate_threshold ON alert_pump_notifications(alert_candidate_id, threshold_x);
+      CREATE INDEX IF NOT EXISTS idx_auto_tuning_results_version_created ON auto_tuning_results(version, created_at);
+      CREATE INDEX IF NOT EXISTS idx_smart_wallet_obs_wallet ON smart_wallet_observations(wallet_address);
+      CREATE INDEX IF NOT EXISTS idx_smart_wallet_obs_token ON smart_wallet_observations(token_address);
+      CREATE INDEX IF NOT EXISTS idx_smart_wallet_obs_alert_run ON smart_wallet_observations(alert_run_id);
+      CREATE INDEX IF NOT EXISTS idx_smart_wallet_obs_scan ON smart_wallet_observations(scan_id);
+      CREATE INDEX IF NOT EXISTS idx_smart_wallet_obs_created_at ON smart_wallet_observations(created_at);
     `).then(() => undefined).catch((error: unknown) => {
       const message = error instanceof Error ? error.message : "unknown error";
 
@@ -1585,6 +2368,8 @@ function buildAlertPostgresStore(databaseUrl: string) {
             "raw_nansen_who_bought_sold",
             "raw_nansen_holders",
             "raw_nansen_dex_trades",
+            "wallet_pdca_summary",
+            "auto_tuning_reasons",
             "quality_gate_reasons",
             "quality_gate_warnings",
             "positive_flags",
@@ -1615,17 +2400,73 @@ function buildAlertPostgresStore(databaseUrl: string) {
         throw error;
       }
     },
+    async saveSmartWalletObservations(observations: SmartWalletObservationRecord[]): Promise<void> {
+      if (!pool || observations.length === 0) return;
+
+      await ready;
+      await pool.query("BEGIN");
+      try {
+        for (const observation of observations) {
+          await pool.query(
+            `INSERT INTO smart_wallet_observations (
+              id, wallet_address, token_address, symbol, source_type, alert_run_id,
+              alert_candidate_id, scan_id, scan_candidate_id, observed_at, side,
+              amount_usd, token_mcap_at_observation, token_price_at_observation,
+              flow_quality, wallet_quality, buyer_seller_balance, sell_pressure,
+              holder_risk, cluster_risk, raw_context, created_at
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21::jsonb,$22)
+            ON CONFLICT(id) DO NOTHING`,
+            [
+              observation.id,
+              observation.wallet_address,
+              observation.token_address,
+              observation.symbol,
+              observation.source_type,
+              observation.alert_run_id,
+              observation.alert_candidate_id,
+              observation.scan_id,
+              observation.scan_candidate_id,
+              observation.observed_at,
+              observation.side,
+              observation.amount_usd,
+              observation.token_mcap_at_observation,
+              observation.token_price_at_observation,
+              observation.flow_quality,
+              observation.wallet_quality,
+              observation.buyer_seller_balance,
+              observation.sell_pressure,
+              observation.holder_risk,
+              observation.cluster_risk,
+              observation.raw_context,
+              observation.created_at,
+            ],
+          );
+        }
+        await refreshSmartWalletProfilesPostgres(pool);
+        await pool.query("COMMIT");
+      } catch (error) {
+        await pool.query("ROLLBACK");
+        throw error;
+      }
+    },
+    async refreshSmartWalletProfiles(): Promise<void> {
+      if (!pool) return;
+
+      await ready;
+      await refreshSmartWalletProfilesPostgres(pool);
+    },
     async savePerformanceSnapshot(snapshot: AlertSnapshotRecord): Promise<void> {
       if (!pool) return;
 
       await ready;
       await pool.query(
         `INSERT INTO alert_performance_snapshots (
-          id, alert_run_id, token_address, snapshot_label, snapshot_time, mcap, price,
+          id, alert_candidate_id, alert_run_id, token_address, snapshot_label, snapshot_time, mcap, price,
           liquidity, volume_24h, return_x, created_at
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
         [
-          `${snapshot.alert_run_id}:${snapshot.token_address}:${snapshot.snapshot_label}`,
+          `${snapshot.alert_candidate_id ?? `${snapshot.alert_run_id}:${snapshot.token_address}`}:${snapshot.snapshot_label}`,
+          snapshot.alert_candidate_id ?? null,
           snapshot.alert_run_id,
           snapshot.token_address,
           snapshot.snapshot_label,
@@ -1640,10 +2481,11 @@ function buildAlertPostgresStore(databaseUrl: string) {
       );
       await pool.query(
         `INSERT INTO alert_peak_performance (
-          id, alert_run_id, token_address, entry_mcap, peak_mcap, peak_return_x,
+          id, alert_candidate_id, alert_run_id, token_address, entry_mcap, peak_mcap, peak_return_x,
           time_to_peak_hours, drawdown_after_peak, best_snapshot_label, updated_at
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,NULL,$8,$9)
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NULL,$9,$10)
         ON CONFLICT(alert_run_id, token_address) DO UPDATE SET
+          alert_candidate_id = COALESCE(alert_peak_performance.alert_candidate_id, excluded.alert_candidate_id),
           peak_mcap = CASE WHEN excluded.peak_return_x > COALESCE(alert_peak_performance.peak_return_x, 0)
             THEN excluded.peak_mcap ELSE alert_peak_performance.peak_mcap END,
           peak_return_x = CASE WHEN excluded.peak_return_x > COALESCE(alert_peak_performance.peak_return_x, 0)
@@ -1654,7 +2496,8 @@ function buildAlertPostgresStore(databaseUrl: string) {
             THEN excluded.best_snapshot_label ELSE alert_peak_performance.best_snapshot_label END,
           updated_at = excluded.updated_at`,
         [
-          `${snapshot.alert_run_id}:${snapshot.token_address}:peak`,
+          `${snapshot.alert_candidate_id ?? `${snapshot.alert_run_id}:${snapshot.token_address}`}:peak`,
+          snapshot.alert_candidate_id ?? null,
           snapshot.alert_run_id,
           snapshot.token_address,
           snapshot.entry_mcap,
@@ -1665,6 +2508,7 @@ function buildAlertPostgresStore(databaseUrl: string) {
           snapshot.created_at,
         ],
       );
+      await refreshSmartWalletProfilesPostgres(pool);
     },
     async close(): Promise<void> {
       await pool?.end();

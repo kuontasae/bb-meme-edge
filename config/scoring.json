@@ -112,14 +112,15 @@
     }
   ],
   "alertRules": {
-    "intervalMinutes": 5,
+    "intervalMinutes": 20,
     "candidatePoolSize": 300,
     "nansenCandidateSize": 240,
     "freshScanDbCandidateSize": 40,
     "watchCandidateSize": 20,
     "preFilterSize": 15,
-    "cliOracleCheckSize": 5,
-    "maxAlertsPerRun": 3,
+    "cliOracleCheckSize": 3,
+    "cliOracleDedupeHours": 12,
+    "maxAlertsPerRun": 2,
     "minMcap": 30000,
     "maxMcap": 2000000,
     "minLiquidityUsd": 15000,
