@@ -296,7 +296,31 @@ MemeStatusは日本語で表示します。
 └ Watch　1 pick｜平均 1.74x
 ```
 
-`/leaderboard` では全体ランキングを確認できます。表示では「Best」ではなく「最高Pick」に統一し、倍率は原則小数2桁、装飾emoji付きsymbolは表示時にcleanします。
+`/leaderboard` では全体ランキングを確認できます。daily / weekly / monthly の各期間で、その期間内に押されたPickを、その期間内に記録された最高倍率で評価します。現在値だけではなく期間内Peakを見るため、一度大きく伸びたmeme coinのチャンスを取り逃がしにくい採点です。
+
+Leaderboard Score:
+
+```text
+Score = max(0, period_peak_return_x - 1) ÷ expected_move_by_mcap × used_points × 10
+```
+
+- `period_peak_return_x`: leaderboard期間内に記録された最高倍率
+- 期間内snapshotの `return_x` 最大値を優先し、なければ保存済みpeakをfallback
+- 1.0x以下は0点で、マイナスはありません
+- `used_points`: Conviction = 3、エアIN = 1、Watch = 0
+- Watchは観察用で、Leaderboard Scoreには影響しません
+
+`expected_move_by_mcap` はPick時点MCap帯で補正します。
+
+| Pick時点MCap | expected_move |
+| --- | ---: |
+| <$100K | 3.0 |
+| $100K-$500K | 2.0 |
+| $500K-$2M | 1.5 |
+| $2M-$10M | 1.0 |
+| $10M+ | 0.75 |
+
+表示では「Best」ではなく「最高Pick」に統一し、倍率は原則小数2桁、装飾emoji付きsymbolは表示時にcleanします。
 
 Paper Pickは実取引ではありません。Discord上でMeme発見ゲームとして参加し、あとから結果を検証するための仕組みです。
 

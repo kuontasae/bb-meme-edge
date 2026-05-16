@@ -966,6 +966,8 @@ type PickPerformance = UserPickWithSignalRecord & {
   normalizedAction: PickAction;
   currentMcap: number | null;
   returnX: number | null;
+  periodPeakReturnX: number | null;
+  expectedMoveByMcap: number;
   pickScore: number | null;
 };
 
@@ -999,6 +1001,12 @@ type UserPickReturn = {
   returnX: number;
   usedPoints: number;
   clickedAt: string;
+};
+
+type BuildPickPerformanceOptions = {
+  periodStartIso?: string;
+  periodEndIso?: string;
+  usePeriodPeak?: boolean;
 };
 
 type MemeResultsReply = {
@@ -1907,6 +1915,49 @@ const getAllUserPicksBetween = db.prepare(`
   INNER JOIN signals ON signals.signal_id = user_picks.signal_id
   WHERE user_picks.clicked_at >= ? AND user_picks.clicked_at < ?
   ORDER BY user_picks.clicked_at DESC
+`);
+const getPickPeriodSnapshotPeak = db.prepare(`
+  SELECT MAX(return_x) AS period_peak_return_x
+  FROM (
+    SELECT return_x
+    FROM candidate_performance_snapshots
+    WHERE token_address = ? AND created_at >= ? AND created_at < ? AND return_x IS NOT NULL
+    UNION ALL
+    SELECT return_x
+    FROM alert_performance_snapshots
+    WHERE token_address = ? AND created_at >= ? AND created_at < ? AND return_x IS NOT NULL
+  ) AS snapshot_peaks
+`);
+const getPickPeriodSavedPeak = db.prepare(`
+  SELECT MAX(peak_return_x) AS period_peak_return_x
+  FROM (
+    SELECT peak_return_x
+    FROM candidate_peak_performance
+    WHERE token_address = ? AND updated_at >= ? AND updated_at < ? AND peak_return_x IS NOT NULL
+    UNION ALL
+    SELECT peak_return_x
+    FROM alert_peak_performance
+    WHERE token_address = ? AND updated_at >= ? AND updated_at < ? AND peak_return_x IS NOT NULL
+  ) AS saved_period_peaks
+`);
+const getPickAnySavedPeak = db.prepare(`
+  SELECT MAX(peak_return_x) AS period_peak_return_x
+  FROM (
+    SELECT peak_return_x
+    FROM candidate_peak_performance
+    WHERE token_address = ? AND updated_at >= ? AND peak_return_x IS NOT NULL
+    UNION ALL
+    SELECT peak_return_x
+    FROM alert_peak_performance
+    WHERE token_address = ? AND updated_at >= ? AND peak_return_x IS NOT NULL
+  ) AS saved_peaks
+`);
+const getAlertCandidateMcapForPick = db.prepare(`
+  SELECT entry_mcap, mcap
+  FROM alert_candidates
+  WHERE token_address = ? AND created_at <= ?
+  ORDER BY created_at DESC
+  LIMIT 1
 `);
 const insertPerformanceSnapshot = db.prepare(`
   INSERT INTO performance_snapshots (
@@ -8310,32 +8361,149 @@ function calculateReturnX(currentMcap: number | null, entryMcap: number | null):
   return currentMcap / entryMcap;
 }
 
-function calculatePickScore(returnX: number | null, usedPoints: number): number | null {
+function calculateExpectedMoveByMcap(entryMcap: number | null): number {
+  if (entryMcap === null || !Number.isFinite(entryMcap) || entryMcap <= 0) {
+    return 1;
+  }
+
+  if (entryMcap < 100_000) {
+    return 3;
+  }
+
+  if (entryMcap < 500_000) {
+    return 2;
+  }
+
+  if (entryMcap < 2_000_000) {
+    return 1.5;
+  }
+
+  if (entryMcap < 10_000_000) {
+    return 1;
+  }
+
+  return 0.75;
+}
+
+function calculatePickScore(returnX: number | null, usedPoints: number, expectedMoveByMcap = 1): number | null {
   if (returnX === null || !Number.isFinite(returnX) || usedPoints <= 0) {
     return null;
   }
 
-  return (returnX - 1) * usedPoints * 100;
+  const expectedMove = expectedMoveByMcap > 0 && Number.isFinite(expectedMoveByMcap)
+    ? expectedMoveByMcap
+    : 1;
+
+  return Math.max(0, returnX - 1) / expectedMove * usedPoints * 10;
+}
+
+function readPeriodPeakValue(row: unknown): number | null {
+  if (!row || typeof row !== "object") {
+    return null;
+  }
+
+  const value = (row as { period_peak_return_x?: unknown }).period_peak_return_x;
+  const numeric = toFiniteNumber(value);
+
+  return numeric !== null && Number.isFinite(numeric) ? numeric : null;
+}
+
+function getIsoMax(a: string, b: string): string {
+  return new Date(a).getTime() >= new Date(b).getTime() ? a : b;
+}
+
+function getPeriodPeakReturnX(pick: UserPickWithSignalRecord, periodStartIso: string, periodEndIso: string): number | null {
+  const peakStartIso = getIsoMax(periodStartIso, pick.clicked_at);
+  const snapshotPeak = readPeriodPeakValue(getPickPeriodSnapshotPeak.get(
+    pick.token_address,
+    peakStartIso,
+    periodEndIso,
+    pick.token_address,
+    peakStartIso,
+    periodEndIso,
+  ));
+
+  if (snapshotPeak !== null) {
+    return snapshotPeak;
+  }
+
+  const savedPeriodPeak = readPeriodPeakValue(getPickPeriodSavedPeak.get(
+    pick.token_address,
+    peakStartIso,
+    periodEndIso,
+    pick.token_address,
+    peakStartIso,
+    periodEndIso,
+  ));
+
+  if (savedPeriodPeak !== null) {
+    return savedPeriodPeak;
+  }
+
+  return readPeriodPeakValue(getPickAnySavedPeak.get(
+    pick.token_address,
+    peakStartIso,
+    pick.token_address,
+    peakStartIso,
+  ));
+}
+
+function getPickEntryMcapForScoring(pick: UserPickWithSignalRecord): number | null {
+  const pickEntryMcap = toFiniteNumber(pick.entry_mcap);
+
+  if (pickEntryMcap !== null && pickEntryMcap > 0) {
+    return pickEntryMcap;
+  }
+
+  const alertCandidate = getAlertCandidateMcapForPick.get(pick.token_address, pick.clicked_at) as
+    | { entry_mcap?: unknown; mcap?: unknown }
+    | undefined;
+  const alertEntryMcap = toFiniteNumber(alertCandidate?.entry_mcap);
+
+  if (alertEntryMcap !== null && alertEntryMcap > 0) {
+    return alertEntryMcap;
+  }
+
+  const alertMcap = toFiniteNumber(alertCandidate?.mcap);
+
+  if (alertMcap !== null && alertMcap > 0) {
+    return alertMcap;
+  }
+
+  const signalMcap = toFiniteNumber(pick.scan_mcap);
+
+  return signalMcap !== null && signalMcap > 0 ? signalMcap : null;
 }
 
 function calculatePickReturn(
   pick: UserPickWithSignalRecord & { normalizedAction: PickAction },
   marketData: DexScreenerMarketData | null,
+  options: BuildPickPerformanceOptions = {},
 ): PickPerformance {
   const currentMcap = marketData?.marketCap ?? null;
+  const periodPeakReturnX = options.usePeriodPeak && options.periodStartIso && options.periodEndIso
+    ? getPeriodPeakReturnX(pick, options.periodStartIso, options.periodEndIso)
+    : null;
+  const entryMcapForScoring = getPickEntryMcapForScoring(pick);
+  const expectedMoveByMcap = calculateExpectedMoveByMcap(entryMcapForScoring);
   const returnX = pick.normalizedAction === "watch"
     ? null
-    : calculateReturnX(currentMcap, pick.entry_mcap);
+    : (periodPeakReturnX ?? calculateReturnX(currentMcap, entryMcapForScoring));
 
   return {
     ...pick,
     currentMcap,
     returnX,
-    pickScore: calculatePickScore(returnX, pick.used_points),
+    periodPeakReturnX,
+    expectedMoveByMcap,
+    pickScore: calculatePickScore(returnX, pick.used_points, expectedMoveByMcap),
   };
 }
 
-async function buildPickPerformances(rows: UserPickWithSignalRecord[]): Promise<PickPerformance[]> {
+async function buildPickPerformances(
+  rows: UserPickWithSignalRecord[],
+  options: BuildPickPerformanceOptions = {},
+): Promise<PickPerformance[]> {
   const normalizedPicks = rows
     .map((pick) => ({ ...pick, normalizedAction: normalizeAction(pick.action) }))
     .filter((pick): pick is UserPickWithSignalRecord & { normalizedAction: PickAction } =>
@@ -8344,14 +8512,16 @@ async function buildPickPerformances(rows: UserPickWithSignalRecord[]): Promise<
   const marketDataByToken = new Map<string, DexScreenerMarketData | null>();
 
   // 同じトークンを複数人がPickしていても、DexScreener取得は1回にまとめます。
-  for (const pick of normalizedPicks) {
-    if (!marketDataByToken.has(pick.token_address)) {
-      marketDataByToken.set(pick.token_address, await fetchDexScreenerMarketData(pick.token_address));
+  if (!options.usePeriodPeak) {
+    for (const pick of normalizedPicks) {
+      if (!marketDataByToken.has(pick.token_address)) {
+        marketDataByToken.set(pick.token_address, await fetchDexScreenerMarketData(pick.token_address));
+      }
     }
   }
 
   return normalizedPicks.map((pick) =>
-    calculatePickReturn(pick, marketDataByToken.get(pick.token_address) ?? null),
+    calculatePickReturn(pick, marketDataByToken.get(pick.token_address) ?? null, options),
   );
 }
 
@@ -8359,7 +8529,6 @@ function calculateUserPerformance(userId: string, picks: PickPerformance[]): Use
   const userPicks = picks.filter((pick) => pick.user_id === userId);
   const scoredPicks = userPicks.filter((pick) =>
     (pick.normalizedAction === "paper_in" || pick.normalizedAction === "conviction") &&
-    pick.entry_mcap !== null &&
     pick.pickScore !== null &&
     pick.returnX !== null,
   );
@@ -10013,7 +10182,7 @@ function formatWinRate(value: number | null): string {
 function averagePickDisplayReturn(picks: PickPerformance[]): number | null {
   return average(
     picks
-      .map((pick) => calculateReturnX(pick.currentMcap, pick.entry_mcap))
+      .map((pick) => pick.returnX)
       .filter((value): value is number => value !== null),
   );
 }
@@ -10055,11 +10224,16 @@ async function getMyReply(
 
   getOrCreateUser(interaction.user.id, now.toISOString(), todayJst);
 
+  const { startIso, endIso } = getPeriodRange("monthly", now);
   const rows = getUserPicksWithSignals.all(interaction.user.id) as UserPickWithSignalRecord[];
-  const pickPerformances = await buildPickPerformances(rows);
+  const pickPerformances = await buildPickPerformances(rows, {
+    periodStartIso: startIso,
+    periodEndIso: endIso,
+    usePeriodPeak: true,
+  });
   const displayRows = pickPerformances.map((pick) => ({
     pick,
-    displayReturnX: calculateReturnX(pick.currentMcap, pick.entry_mcap),
+    displayReturnX: pick.returnX,
   }));
   const displayReturns = displayRows
     .map((row) => row.displayReturnX)
@@ -10118,7 +10292,11 @@ async function getLeaderboardReply(
   const period = (interaction.options.getString("period") ?? "daily") as PerformancePeriod;
   const { startIso, endIso } = getPeriodRange(period);
   const rows = getAllUserPicksBetween.all(startIso, endIso) as UserPickWithSignalRecord[];
-  const pickPerformances = await buildPickPerformances(rows);
+  const pickPerformances = await buildPickPerformances(rows, {
+    periodStartIso: startIso,
+    periodEndIso: endIso,
+    usePeriodPeak: true,
+  });
   const userIds = Array.from(new Set(pickPerformances.map((pick) => pick.user_id)));
   const performances = userIds
     .map((userId) => calculateUserPerformance(userId, pickPerformances))
@@ -10159,7 +10337,7 @@ async function getLeaderboardReply(
         .setTitle(`🏆 bb Meme Edge ランキング - ${getPerformancePeriodLabel(period)}`)
         .setColor(0xf1c40f)
         .setDescription(lines.join("\n").trim())
-        .setFooter({ text: "Score = (return_x - 1) × used_points × 100" })
+        .setFooter({ text: "Score=max(0,期間内最高-1)÷MCap期待倍率×使用pt×10 / Watchは0pt" })
         .setTimestamp(new Date()),
     ],
   };
@@ -10178,7 +10356,11 @@ async function getMyPerformanceReply(
     startIso,
     endIso,
   ) as UserPickWithSignalRecord[];
-  const pickPerformances = await buildPickPerformances(rows);
+  const pickPerformances = await buildPickPerformances(rows, {
+    periodStartIso: startIso,
+    periodEndIso: endIso,
+    usePeriodPeak: true,
+  });
   const performance = calculateUserPerformance(interaction.user.id, pickPerformances);
   const recentScoredPicks = performance.recentPicks
     .filter((pick) => pick.normalizedAction === "paper_in" || pick.normalizedAction === "conviction")
@@ -10192,7 +10374,7 @@ async function getMyPerformanceReply(
     ? recentScoredPicks.map((pick) => {
       const symbol = pick.symbol ? formatDisplaySymbol(pick.symbol) : shortenAddress(pick.token_address);
 
-      return `${pick.normalizedAction === "conviction" ? "🔥" : "🧪"} ${symbol} → ${formatReturnX(pick.returnX)} / ${formatScore(pick.pickScore)}`;
+      return `${pick.normalizedAction === "conviction" ? "🔥" : "🧪"} ${symbol} 最高 ${formatReturnX(pick.returnX)} / ${formatScore(pick.pickScore)}`;
     })
     : ["Score対象のRecent Pickはまだありません。"];
 
@@ -10221,7 +10403,7 @@ async function getMyPerformanceReply(
           ...recentLines,
           "",
           "Score計算:",
-          "(return_x - 1) × used_points × 100",
+          "max(0, 期間内最高倍率 - 1) ÷ MCap帯の期待倍率 × 使用pt × 10",
         ].join("\n"))
         .setTimestamp(now),
     ],
